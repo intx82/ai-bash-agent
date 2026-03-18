@@ -57,7 +57,7 @@ Rules:
 - If type == "tool", output ONLY the tool JSON (do not include a final answer in the same reply).
 - If you need to publish code/markdown: put it ONLY in files[].content (NOT in message).
 - For modifying existing files: use patches[] (NOT sed/perl -pi).
-- Use ONLY relative paths in files[].path and patches[].path (no /abs, no .., no ~).
+- For writing new files: use files[] (NOT sed/echo/python)
 - Bash commands run in a temporary working directory (empty sandbox). Use relative paths and create files there.
 - Avoid dangerous commands unless user explicitly requests and confirms.
 - If the user asks found something in the internet use DuckDuckGo (`ddgr [QUERY] --np --json`). 
