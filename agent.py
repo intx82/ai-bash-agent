@@ -27,7 +27,9 @@ Output must be valid JSON parsable by json.loads().
 Do not include markdown.
 Do not include code fences.
 Do not include any text before or after the JSON object.
-Do not output keys other than: type, plan, message, tool, commands.
+
+Allowed top-level keys are: type, plan, message, tool, commands, files, patches.
+
 When emitting shell commands containing regex, ensure the JSON remains valid by escaping backslashes for JSON.
 Example:
 grep -oP '(\\d{1,2}:\\d{2})'
@@ -57,7 +59,7 @@ Rules:
 - If type == "tool", output ONLY the tool JSON (do not include a final answer in the same reply).
 - If you need to publish code/markdown: put it ONLY in files[].content (NOT in message).
 - For modifying existing files: use patches[] (NOT sed/perl -pi).
-- For writing new files: use files[] (NOT sed/echo/python)
+- For writing new files: use files[] (NOT sed/echo/python/cat heredocs).
 - Bash commands run in a temporary working directory (empty sandbox). Use relative paths and create files there.
 - Avoid dangerous commands unless user explicitly requests and confirms.
 - If the user asks found something in the internet use DuckDuckGo (`ddgr [QUERY] --np --json`). 
@@ -77,6 +79,7 @@ DuckDuckGo (ddgr) Output JSON will have next schema:
 """
 
 MAX_TOOL_ROUNDS = 32
+MAX_CMD_CHARS = 4000
 
 
 def user_requires_tool(user_input: str) -> bool:
@@ -94,11 +97,29 @@ def run_bash_command(command: str, cwd: str, timeout_s: int = 300) -> Dict[str, 
             text=True,
             timeout=timeout_s,
         )
-        return {"command": command, "cwd": cwd, "stdout": r.stdout, "stderr": r.stderr, "returncode": r.returncode}
+        return {
+            "command": command,
+            "cwd": cwd,
+            "stdout": r.stdout,
+            "stderr": r.stderr,
+            "returncode": r.returncode,
+        }
     except subprocess.TimeoutExpired:
-        return {"command": command, "cwd": cwd, "stdout": "", "stderr": f"timeout after {timeout_s}s", "returncode": 124}
+        return {
+            "command": command,
+            "cwd": cwd,
+            "stdout": "",
+            "stderr": f"timeout after {timeout_s}s",
+            "returncode": 124,
+        }
     except Exception as e:
-        return {"command": command, "cwd": cwd, "stdout": "", "stderr": str(e), "returncode": 1}
+        return {
+            "command": command,
+            "cwd": cwd,
+            "stdout": "",
+            "stderr": str(e),
+            "returncode": 1,
+        }
 
 
 def strip_code_fences(text: str) -> str:
@@ -113,16 +134,18 @@ def parse_assistant_json_objects(raw: str) -> Optional[List[Dict[str, Any]]]:
     """
     Parses one or more JSON objects concatenated together (NDJSON-ish).
     Returns a list of dicts, or None if parsing fails.
+    Never raises.
     """
     if not raw:
         return None
 
     txt = strip_code_fences(raw)
-    print(raw)
+
     dec = json.JSONDecoder()
     i = 0
     objs: List[Dict[str, Any]] = []
 
+    # Prefer raw-decode loop for {}{} or {}\n{} cases
     try:
         while i < len(txt):
             while i < len(txt) and txt[i].isspace():
@@ -138,12 +161,20 @@ def parse_assistant_json_objects(raw: str) -> Optional[List[Dict[str, Any]]]:
     except Exception:
         pass
 
-    s = txt.find("{")
-    e = txt.rfind("}")
-    if s != -1 and e != -1 and e > s:
-        obj = json.loads(txt[s : e + 1])
+    # Fallback: extract a single {...} block
+    try:
+        s = txt.find("{")
+        e = txt.rfind("}")
+        if s != -1 and e != -1 and e > s:
+            obj = json.loads(txt[s : e + 1])
+            if isinstance(obj, dict):
+                return [obj]
+        # Final fallback: whole string
+        obj = json.loads(txt)
         if isinstance(obj, dict):
             return [obj]
+    except Exception:
+        return None
 
     return None
 
@@ -151,8 +182,8 @@ def parse_assistant_json_objects(raw: str) -> Optional[List[Dict[str, Any]]]:
 def _is_safe_relative_path(p: str) -> bool:
     if not p or not isinstance(p, str):
         return False
-    # if p.startswith(("/", "~")):
-    #     return False
+    if p.startswith(("/", "~")):
+        return False
     # Windows drive letters
     if re.match(r"^[A-Za-z]:[\\/]", p):
         return False
@@ -351,6 +382,10 @@ def render_assistant(obj: Dict[str, Any]) -> None:
         print(f"\nAgent: {msg}\n")
 
 
+def LINE():
+    return sys._getframe(1).f_lineno
+
+
 def run_agent_turn(
     backend: Any,
     messages: List[Dict[str, str]],
@@ -363,23 +398,41 @@ def run_agent_turn(
     messages.append({"role": "user", "content": user_input})
 
     need_tool = user_requires_tool(user_input)
-    tool_was_used = False
+
+    # This gate becomes True only after:
+    # - tool executed successfully, OR
+    # - user explicitly denied tool execution (so model can answer without tool).
+    tool_gate_open = not need_tool
 
     for _round in range(MAX_TOOL_ROUNDS):
         raw = backend.chat_completion(messages=messages, max_tokens=max_tokens, temperature=temperature)
         if not raw:
             print("✗ No response from model.")
             return
-        
+
+        print(raw)
+        # Empty completion is a real case (EOS immediately). Retry without calling it “protocol violation”.
+        if raw.strip() == "":
+            print("---- !! Agent: (Empty answer) ----\n")
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "TOOL_RESULT "
+                    + json.dumps(
+                        {
+                            "ok": False,
+                            "error": "Empty response. Reply again with exactly ONE valid JSON object.",
+                        }
+                    ),
+                }
+            )
+            continue
+
         try:
             objs = parse_assistant_json_objects(raw)
         except Exception as ex:
             print(raw)
-            messages.append({"role": "assistant", "content": raw})
-            messages.append({"role": "system", "content": f"You're answer violates JSON structure. json.loads raise exception: {ex}"})
-            continue
-
-
+            objs = None
         if not objs:
             print("Agent: (protocol violation: expected JSON)\n")
             print(raw)
@@ -387,14 +440,22 @@ def run_agent_turn(
             messages.append({"role": "system", "content": "You are violate JSON structure. Provided answer is not JSON. Correct previous request and try again."})
             continue
 
-        if len(objs) > 1:
-            print("⚠️ Model returned multiple JSON objects; tools will be executed first and extra messages ignored.\n")
+
+        # If multiple objects and ANY tool exists, ignore message objects and handle tool first.
+        any_tool_obj = any(
+            isinstance(o, dict) and o.get("type") == "tool" and o.get("tool") == "bash"
+            for o in objs
+        )
+        if len(objs) > 1 and any_tool_obj:
+            print(
+                "⚠️ Multiple JSON objects; prioritizing tool request and ignoring message objects.\n"
+            )
 
         for obj in objs:
             if not isinstance(obj, dict) or "type" not in obj or "plan" not in obj:
                 messages.append({
                     "role": "user",
-                    "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": "invalid JSON schema; reply with one valid object"})
+                    "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": "Invalid JSON schema; reply with one valid object."})
                 })
                 break
 
@@ -440,20 +501,30 @@ def run_agent_turn(
                         "details": (w_err + p_err),
                     })
                 })
-                break  # next tool round
+                break  # next round
 
             render_assistant(obj)
 
             typ = obj.get("type")
 
-            if typ == "message" and need_tool and not tool_was_used:
-                messages.append({
-                    "role": "user",
-                    "content": "TOOL_RESULT " + json.dumps({
-                        "ok": False,
-                        "error": "Tool is required for this request. Reply with type='tool', tool='bash', and commands[] to compile/run/test. Do not guess outputs."
-                    })
-                })
+            # If there is a tool object in the same response, ignore message objects here
+            if typ == "message" and any_tool_obj:
+                continue
+
+            # Guard: if user asked to compile/run/test and tool not yet executed/denied, force tool
+            if typ == "message" and need_tool and not tool_gate_open:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "TOOL_RESULT "
+                        + json.dumps(
+                            {
+                                "ok": False,
+                                "error": "Tool is required. Reply with type='tool', tool='bash', and commands[] to compile/run/test. Do not guess outputs.",
+                            }
+                        ),
+                    }
+                )
                 break
 
             if typ == "message":
@@ -463,57 +534,77 @@ def run_agent_turn(
                 commands = obj.get("commands", [])
                 if not isinstance(commands, list) or not commands:
                     messages.append({
-                        "role": "user",
-                        "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": "missing commands[]"})
-                    })
-                    tool_was_used = True
+                            "role": "user",
+                            "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": "missing commands[]"})
+                        })
                     break
 
-                print("!" * 50)
-                print("⚠️  BASH TOOL REQUEST ⚠️")
-                print("!" * 50)
-                print(f"(cwd = {workdir})")
-                for i, c in enumerate(commands, 1):
-                    print(f"{i}) {c}")
-                print("!" * 50 + "\n")
-
-                if no_confirm:
-                    confirm = "y"
-                else:
-                    confirm = input(f"Execute {len(commands)} command(s)? (y/N): ").strip().lower()
-
-                if confirm != "y":
-                    print("Command(s) cancelled.\n")
-                    messages.append({
-                        "role": "user",
-                        "content": "TOOL_RESULT " + json.dumps({"ok": False, "denied": True})
-                    })
-                    tool_was_used = True
-                    break
-
-                results = []
+                # Runtime guards — do NOT open the tool gate on these rejections
                 for c in commands:
-                    print(f"Executing: {c}")
-                    r = run_bash_command(c, cwd=workdir)
-                    results.append(r)
-                    if r["stdout"]:
-                        print("STDOUT:\n" + r["stdout"])
-                    if r["stderr"]:
-                        print("STDERR:\n" + r["stderr"])
-                    print(f"Return Code: {r['returncode']}\n")
+                    if len(c) > MAX_CMD_CHARS:
+                        messages.append({
+                                "role": "user",
+                                "content": "TOOL_RESULT "
+                                + json.dumps({
+                                        "ok": False,
+                                        "error": f"Command too large ({len(c)} chars). Put code into files[] and use short commands for build/run.",
+                                    }),
+                            })
+                        break
+                else:
+                    # Only reached if no breaks => guards passed
+                    print("!" * 50)
+                    print("⚠️  BASH TOOL REQUEST ⚠️")
+                    print("!" * 50)
+                    print(f"(cwd = {workdir})")
+                    for i, c in enumerate(commands, 1):
+                        print(f"{i}) {c}")
+                    print("!" * 50 + "\n")
 
-                messages.append({
+                    if no_confirm:
+                        confirm = "y"
+                    else:
+                        confirm = (input(f"Execute {len(commands)} command(s)? (y/N): ").strip().lower())
+
+                    if confirm != "y":
+                        print("Command(s) cancelled.\n")
+                        messages.append({
+                            "role": "user",
+                            "content": "TOOL_RESULT " + json.dumps({"ok": False, "denied": True})
+                        })
+                        
+                        # User denial opens the “you may answer without tool” gate
+                        tool_gate_open = True
+                        break
+
+                    results = []
+                    for c in commands:
+                        print(f"Executing: {c}")
+                        r = run_bash_command(c, cwd=workdir)
+                        results.append(r)
+                        if r["stdout"]:
+                            print("STDOUT:\n" + r["stdout"])
+                        if r["stderr"]:
+                            print("STDERR:\n" + r["stderr"])
+                        print(f"Return Code: {r['returncode']}\n")
+
+                    messages.append({
                     "role": "user",
                     "content": "TOOL_RESULT " + json.dumps({"ok": True, "results": results})
-                })
-                tool_was_used = True
+                    })
+                    
+                    
+                    tool_gate_open = True
+                    break  # next round
+
+                # If guard rejected a command (break inside guards), go next round
                 break
 
             messages.append({
                 "role": "user",
                 "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": "unknown tool/type; use type=message or type=tool(tool=bash)"})
             })
-            tool_was_used = True
+            tool_gate_open = True
             break
 
     print("Agent: Reached tool-round limit.\n")
@@ -615,6 +706,7 @@ def main():
                     workdir=workspace.name,
                 )
 
+                # Keep system + last 20 messages
                 if len(messages) > 21:
                     messages = [messages[0]] + messages[-20:]
 
