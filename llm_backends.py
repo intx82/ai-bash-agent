@@ -12,10 +12,10 @@ import requests
 # --------------------------
 # Agent response schema (strict)
 # --------------------------
-
+# IMPORTANT: don't put additionalProperties: false at the top-level with oneOf here.
+# Keep strictness inside each oneOf branch instead.
 AGENT_RESPONSE_SCHEMA: Dict[str, Any] = {
     "type": "object",
-    "additionalProperties": False,
     "oneOf": [
         {
             "type": "object",
@@ -24,31 +24,21 @@ AGENT_RESPONSE_SCHEMA: Dict[str, Any] = {
                 "type": {"type": "string", "const": "message"},
                 "plan": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
                 "message": {"type": "string"},
-
-                # Optional: publish code / markdown / long content safely
                 "files": {
                     "type": "array",
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
-                        "properties": {
-                            "path": {"type": "string"},
-                            "content": {"type": "string"},
-                        },
+                        "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
                         "required": ["path", "content"],
                     },
                 },
-
-                # Optional: small edits as a unified diff (preferred over sed)
                 "patches": {
                     "type": "array",
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
-                        "properties": {
-                            "path": {"type": "string"},
-                            "diff": {"type": "string"},
-                        },
+                        "properties": {"path": {"type": "string"}, "diff": {"type": "string"}},
                         "required": ["path", "diff"],
                     },
                 },
@@ -64,17 +54,12 @@ AGENT_RESPONSE_SCHEMA: Dict[str, Any] = {
                 "tool": {"type": "string", "enum": ["bash"]},
                 "commands": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                 "message": {"type": "string"},
-
-                # Allow these here too (sometimes useful to write/patch before executing)
                 "files": {
                     "type": "array",
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
-                        "properties": {
-                            "path": {"type": "string"},
-                            "content": {"type": "string"},
-                        },
+                        "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
                         "required": ["path", "content"],
                     },
                 },
@@ -83,10 +68,7 @@ AGENT_RESPONSE_SCHEMA: Dict[str, Any] = {
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
-                        "properties": {
-                            "path": {"type": "string"},
-                            "diff": {"type": "string"},
-                        },
+                        "properties": {"path": {"type": "string"}, "diff": {"type": "string"}},
                         "required": ["path", "diff"],
                     },
                 },
@@ -135,11 +117,14 @@ class BackendConfig:
 # --------------------------
 # llama.cpp backend (OpenAI-compatible endpoint)
 # --------------------------
+
 class LlamaCppBackend:
     """
-    Talks to a llama.cpp OpenAI-compatible /v1/chat/completions server via requests.Session()
-    to get HTTP keep-alive / connection reuse, and pins requests to a slot (id_slot)
-    so the server doesn't accumulate multiple prompt caches.
+    OpenAI-compatible llama.cpp /v1/chat/completions backend using requests.Session() (keep-alive).
+
+    Robustness improvements:
+    - Try with id_slot/cache_prompt, then retry without them (some builds reject these params).
+    - Try response_format json_schema/json_object, then retry without response_format.
     """
 
     def __init__(self, cfg: BackendConfig):
@@ -149,11 +134,7 @@ class LlamaCppBackend:
         if cfg.api_key:
             self.session.headers["Authorization"] = f"Bearer {cfg.api_key}"
 
-        # Pin all requests to one slot unless overridden
-        # (useful when server runs with --parallel > 1)
         self.id_slot = int(os.environ.get("LLAMA_ID_SLOT", "0"))
-
-        # Explicitly request prompt caching (default is usually true, but be explicit)
         self.cache_prompt = True
 
     def check_connection(self) -> bool:
@@ -180,42 +161,49 @@ class LlamaCppBackend:
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": False,
-
-            # Slot/KV-cache controls
-            "id_slot": self.id_slot,
-            "cache_prompt": self.cache_prompt,
         }
 
-        # llama.cpp support varies; try schema -> json_object -> none
-        payload_variants: List[Dict[str, Any]] = []
+        # With and without slot pinning (fallback if unsupported)
+        bases: List[Dict[str, Any]] = []
 
+        with_slot = dict(base_payload)
+        with_slot["id_slot"] = self.id_slot
+        with_slot["cache_prompt"] = self.cache_prompt
+        bases.append(with_slot)
+
+        bases.append(base_payload)
+
+        # response_format variants (fallback to None)
+        rfs: List[Optional[Dict[str, Any]]] = []
         if self.cfg.prefer_json_schema:
-            p = dict(base_payload)
-            p["response_format"] = AGENT_RESPONSE_FORMAT_JSON_SCHEMA
-            payload_variants.append(p)
-
-        p2 = dict(base_payload)
-        p2["response_format"] = AGENT_RESPONSE_FORMAT_JSON_OBJECT
-        payload_variants.append(p2)
-
-        payload_variants.append(base_payload)
+            rfs.append(AGENT_RESPONSE_FORMAT_JSON_SCHEMA)
+        rfs.append(AGENT_RESPONSE_FORMAT_JSON_OBJECT)
+        rfs.append(None)
 
         last_err: Optional[str] = None
-        for payload in payload_variants:
-            try:
-                # Separate connect/read timeouts: connect fast, read can be long.
-                timeout = (5, self.cfg.request_timeout_s)
-                r = self.session.post(self.cfg.url, json=payload, timeout=timeout)
-                if r.status_code != 200:
-                    last_err = f"{r.status_code}: {r.text[:200]}"
-                    continue
-                data = r.json()
-                return data["choices"][0]["message"]["content"]
-            except Exception as e:
-                last_err = str(e)
+
+        for base in bases:
+            for rf in rfs:
+                payload = dict(base)
+                if rf is not None:
+                    payload["response_format"] = rf
+
+                try:
+                    timeout = (5, self.cfg.request_timeout_s)
+                    r = self.session.post(self.cfg.url, json=payload, timeout=timeout)
+                    if r.status_code != 200:
+                        last_err = f"{r.status_code}: {r.text[:200]}"
+                        continue
+                    data = r.json()
+                    content = data["choices"][0]["message"].get("content", "")
+                    # content can legitimately be "" (EOS immediately)
+                    return content if isinstance(content, str) else ""
+                except Exception as e:
+                    last_err = str(e)
 
         print(f"✗ llama.cpp request failed: {last_err}")
         return None
+
 
 # --------------------------
 # OpenAI / ChatGPT backend (official SDK)
@@ -242,10 +230,7 @@ class OpenAIChatGPTBackend:
             raise RuntimeError("OPENAI_API_KEY env var is not set.")
 
         base_url = os.environ.get("OPENAI_BASE_URL")
-        if base_url:
-            self.client = OpenAI(api_key=api_key, base_url=base_url)
-        else:
-            self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
 
     def check_connection(self) -> bool:
         try:
@@ -261,15 +246,12 @@ class OpenAIChatGPTBackend:
         max_tokens: int,
         temperature: float,
     ) -> Optional[str]:
-        # Some models support json_schema, others only json_object, others none.
         response_format_variants: List[Optional[Dict[str, Any]]] = []
         if self.cfg.prefer_json_schema:
             response_format_variants.append(AGENT_RESPONSE_FORMAT_JSON_SCHEMA)
         response_format_variants.append(AGENT_RESPONSE_FORMAT_JSON_OBJECT)
         response_format_variants.append(None)
 
-        # GPT-5 family often requires max_completion_tokens instead of max_tokens.
-        # Also, some models reject temperature (or treat it differently).
         param_variants: List[Dict[str, Any]] = [
             {"max_completion_tokens": max_tokens, "temperature": temperature},
             {"max_completion_tokens": max_tokens},
@@ -281,19 +263,13 @@ class OpenAIChatGPTBackend:
         for rf in response_format_variants:
             for pv in param_variants:
                 try:
-                    kwargs: Dict[str, Any] = {
-                        "model": self.cfg.model,
-                        "messages": messages,
-                        **pv,
-                    }
+                    kwargs: Dict[str, Any] = {"model": self.cfg.model, "messages": messages, **pv}
                     if rf is not None:
                         kwargs["response_format"] = rf
-
                     completion = self.client.chat.completions.create(**kwargs)
                     return completion.choices[0].message.content
                 except Exception as e:
                     last_err = str(e)
-                    continue
 
         print(f"✗ OpenAI request failed: {last_err}")
         return None

@@ -24,8 +24,6 @@ You are a helpful AI assistant with access to a local bash tool.
 You MUST respond with EXACTLY ONE JSON object and NOTHING ELSE.
 NO markdown fences. NEVER output ```.
 Output must be valid JSON parsable by json.loads().
-Do not include markdown.
-Do not include code fences.
 Do not include any text before or after the JSON object.
 
 Allowed top-level keys are: type, plan, message, tool, commands, files, patches.
@@ -40,17 +38,17 @@ Schema:
   "plan": ["short bullet", "short bullet"],
   "message": "user-facing text",
 
-  "files": [                       // optional, for code / long text / markdown
+  "files": [
     {"path": "relative/path.ext", "content": "file contents as a JSON string"}
   ],
 
-  "patches": [                     // optional, for small edits (prefer over sed)
+  "patches": [
     {"path": "relative/path.ext", "diff": "unified diff string"}
   ],
 
-  "tool": "bash",                  // only when type == "tool"
-  "commands": ["cmd1", "cmd2"]     // only when type == "tool"
-} // always close the brackets
+  "tool": "bash",
+  "commands": ["cmd1", "cmd2"]
+}
 
 Rules:
 - plan: 1-3 short bullets. Do NOT output hidden step-by-step reasoning.
@@ -97,29 +95,11 @@ def run_bash_command(command: str, cwd: str, timeout_s: int = 300) -> Dict[str, 
             text=True,
             timeout=timeout_s,
         )
-        return {
-            "command": command,
-            "cwd": cwd,
-            "stdout": r.stdout,
-            "stderr": r.stderr,
-            "returncode": r.returncode,
-        }
+        return {"command": command, "cwd": cwd, "stdout": r.stdout, "stderr": r.stderr, "returncode": r.returncode}
     except subprocess.TimeoutExpired:
-        return {
-            "command": command,
-            "cwd": cwd,
-            "stdout": "",
-            "stderr": f"timeout after {timeout_s}s",
-            "returncode": 124,
-        }
+        return {"command": command, "cwd": cwd, "stdout": "", "stderr": f"timeout after {timeout_s}s", "returncode": 124}
     except Exception as e:
-        return {
-            "command": command,
-            "cwd": cwd,
-            "stdout": "",
-            "stderr": str(e),
-            "returncode": 1,
-        }
+        return {"command": command, "cwd": cwd, "stdout": "", "stderr": str(e), "returncode": 1}
 
 
 def strip_code_fences(text: str) -> str:
@@ -136,7 +116,7 @@ def parse_assistant_json_objects(raw: str) -> Optional[List[Dict[str, Any]]]:
     Returns a list of dicts, or None if parsing fails.
     Never raises.
     """
-    if not raw:
+    if raw is None:
         return None
 
     txt = strip_code_fences(raw)
@@ -145,7 +125,7 @@ def parse_assistant_json_objects(raw: str) -> Optional[List[Dict[str, Any]]]:
     i = 0
     objs: List[Dict[str, Any]] = []
 
-    # Prefer raw-decode loop for {}{} or {}\n{} cases
+    # raw-decode loop (best for {}{} or {}\n{} cases)
     try:
         while i < len(txt):
             while i < len(txt) and txt[i].isspace():
@@ -161,7 +141,7 @@ def parse_assistant_json_objects(raw: str) -> Optional[List[Dict[str, Any]]]:
     except Exception:
         pass
 
-    # Fallback: extract a single {...} block
+    # fallback: extract first {...} or whole string
     try:
         s = txt.find("{")
         e = txt.rfind("}")
@@ -182,11 +162,10 @@ def parse_assistant_json_objects(raw: str) -> Optional[List[Dict[str, Any]]]:
 def _is_safe_relative_path(p: str) -> bool:
     if not p or not isinstance(p, str):
         return False
-    if p.startswith(("/", "~")):
-        return False
-    # Windows drive letters
-    if re.match(r"^[A-Za-z]:[\\/]", p):
-        return False
+    # if p.startswith(("/", "~")):
+    #     return False
+    # if re.match(r"^[A-Za-z]:[\\/]", p):  # Windows drive letters
+    #     return False
     pp = Path(p)
     if any(part == ".." for part in pp.parts):
         return False
@@ -221,7 +200,6 @@ def write_files_from_obj(obj: Dict[str, Any], workdir: str) -> Tuple[List[str], 
         if not isinstance(path, str) or not isinstance(content, str):
             errors.append(f"files[{idx}] missing/invalid path or content")
             continue
-
         if not _is_safe_relative_path(path):
             errors.append(f"files[{idx}] unsafe path: {path!r}")
             continue
@@ -244,27 +222,17 @@ def write_files_from_obj(obj: Dict[str, Any], workdir: str) -> Tuple[List[str], 
 
 
 def _extract_paths_from_unified_diff(diff: str) -> List[str]:
-    """
-    Extract file paths referenced by a unified diff. Best-effort.
-    Returns normalized relative paths with a/ and b/ stripped when present.
-    """
     paths: List[str] = []
-
-    # diff --git a/foo b/foo
     for m in re.finditer(r"^diff --git a/(\S+) b/(\S+)\s*$", diff, re.MULTILINE):
         paths.extend([m.group(1), m.group(2)])
-
-    # --- a/foo / +++ b/foo or --- foo / +++ foo
     for m in re.finditer(r"^(---|\+\+\+)\s+(\S+)\s*$", diff, re.MULTILINE):
         p = m.group(2)
         if p == "/dev/null":
             continue
-        # Strip a/ b/ prefixes
         if p.startswith("a/") or p.startswith("b/"):
             p = p[2:]
         paths.append(p)
 
-    # Dedup preserving order
     out: List[str] = []
     seen = set()
     for p in paths:
@@ -275,17 +243,9 @@ def _extract_paths_from_unified_diff(diff: str) -> List[str]:
 
 
 def apply_patches_from_obj(obj: Dict[str, Any], workdir: str) -> Tuple[List[str], List[str]]:
-    """
-    Applies obj["patches"] using the system 'patch' utility (runtime-controlled, not model-controlled).
-    Safety:
-      - requires patches[].path to be safe relative
-      - rejects diffs that reference other file paths
-    Returns (patched_paths, error_messages).
-    """
     patches = obj.get("patches")
     if not patches:
         return ([], [])
-
     if not isinstance(patches, list):
         return ([], ["patches must be an array"])
 
@@ -293,11 +253,10 @@ def apply_patches_from_obj(obj: Dict[str, Any], workdir: str) -> Tuple[List[str]
     patched: List[str] = []
     errors: List[str] = []
 
-    # Ensure patch tool exists
     try:
         subprocess.run(["patch", "--version"], capture_output=True, text=True, timeout=5)
     except Exception:
-        return ([], ["'patch' tool is not available on this system. Install it (e.g. apt install patch)."])
+        return ([], ["'patch' tool is not available. Install it (e.g. apt install patch)."])
 
     for idx, item in enumerate(patches):
         if not isinstance(item, dict):
@@ -310,12 +269,10 @@ def apply_patches_from_obj(obj: Dict[str, Any], workdir: str) -> Tuple[List[str]
         if not isinstance(path, str) or not isinstance(diff, str):
             errors.append(f"patches[{idx}] missing/invalid path or diff")
             continue
-
         if not _is_safe_relative_path(path):
             errors.append(f"patches[{idx}] unsafe path: {path!r}")
             continue
 
-        # Ensure target path stays within workspace
         target = (root / Path(path)).resolve()
         try:
             rel = target.relative_to(root)
@@ -323,7 +280,6 @@ def apply_patches_from_obj(obj: Dict[str, Any], workdir: str) -> Tuple[List[str]
             errors.append(f"patches[{idx}] path escapes workspace: {path!r}")
             continue
 
-        # Validate diff only references this file (best-effort)
         referenced = _extract_paths_from_unified_diff(diff)
         bad_refs = []
         for rp in referenced:
@@ -333,12 +289,9 @@ def apply_patches_from_obj(obj: Dict[str, Any], workdir: str) -> Tuple[List[str]
                 bad_refs.append(rp)
 
         if bad_refs:
-            errors.append(
-                f"patches[{idx}] diff references other/unsafe paths: {bad_refs!r} (expected only {path!r})"
-            )
+            errors.append(f"patches[{idx}] diff references other/unsafe paths: {bad_refs!r} (expected only {path!r})")
             continue
 
-        # Apply diff. Try git-style first (-p1), then plain (-p0).
         applied = False
         last = ""
         for pstrip in (1, 0):
@@ -382,8 +335,12 @@ def render_assistant(obj: Dict[str, Any]) -> None:
         print(f"\nAgent: {msg}\n")
 
 
-def LINE():
-    return sys._getframe(1).f_lineno
+def _bad_edit_command(cmd: str) -> Optional[str]:
+    if re.search(r"\bsed\s+-i\b", cmd):
+        return "sed -i"
+    if re.search(r"\bperl\s+-pi\b", cmd):
+        return "perl -pi"
+    return None
 
 
 def run_agent_turn(
@@ -394,103 +351,74 @@ def run_agent_turn(
     temperature: float,
     no_confirm: bool,
     workdir: str,
+    debug: bool = False,
 ) -> None:
     messages.append({"role": "user", "content": user_input})
-
     need_tool = user_requires_tool(user_input)
 
-    # This gate becomes True only after:
-    # - tool executed successfully, OR
-    # - user explicitly denied tool execution (so model can answer without tool).
+    # gate becomes True only after bash executed or explicitly denied
     tool_gate_open = not need_tool
 
     for _round in range(MAX_TOOL_ROUNDS):
         raw = backend.chat_completion(messages=messages, max_tokens=max_tokens, temperature=temperature)
-        if not raw:
+
+        if raw is None:
             print("✗ No response from model.")
             return
 
-        print(raw)
-        # Empty completion is a real case (EOS immediately). Retry without calling it “protocol violation”.
+        if debug:
+            print(f"---- RAW (first 1000) ----\n{raw[:1000]}\n-------------------------")
+
+        # Empty completion is a real case. Treat it as "retry", not protocol violation.
         if raw.strip() == "":
-            print("---- !! Agent: (Empty answer) ----\n")
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "TOOL_RESULT "
-                    + json.dumps(
-                        {
-                            "ok": False,
-                            "error": "Empty response. Reply again with exactly ONE valid JSON object.",
-                        }
-                    ),
-                }
-            )
+            messages.append({
+                "role": "user",
+                "content": "TOOL_RESULT " + json.dumps({
+                    "ok": False,
+                    "error": "Empty response. Reply again with exactly ONE valid JSON object.",
+                }),
+            })
             continue
 
-        try:
-            objs = parse_assistant_json_objects(raw)
-        except Exception as ex:
-            print(raw)
-            objs = None
+        objs = parse_assistant_json_objects(raw)
         if not objs:
-            print("Agent: (protocol violation: expected JSON)\n")
-            print(raw)
-            messages.append({"role": "assistant", "content": raw})
-            messages.append({"role": "system", "content": "You are violate JSON structure. Provided answer is not JSON. Correct previous request and try again."})
+            # Do NOT add a system message (it grows prompts and hurts behavior).
+            messages.append({
+                "role": "user",
+                "content": "TOOL_RESULT " + json.dumps({
+                    "ok": False,
+                    "error": "Your previous reply was not valid JSON. Reply again with exactly ONE JSON object and no extra text.",
+                    "raw_snippet": raw[:300],
+                }),
+            })
             continue
 
+        # If any tool object exists, prioritize tool objects and ignore message objects in this reply.
+        tool_objs = [o for o in objs if isinstance(o, dict) and o.get("type") == "tool" and o.get("tool") == "bash"]
+        any_tool_obj = bool(tool_objs)
 
-        # If multiple objects and ANY tool exists, ignore message objects and handle tool first.
-        any_tool_obj = any(
-            isinstance(o, dict) and o.get("type") == "tool" and o.get("tool") == "bash"
-            for o in objs
-        )
         if len(objs) > 1 and any_tool_obj:
-            print(
-                "⚠️ Multiple JSON objects; prioritizing tool request and ignoring message objects.\n"
-            )
+            print("⚠️ Multiple JSON objects received; prioritizing tool request.\n")
 
-        for obj in objs:
+        ordered = tool_objs if any_tool_obj else objs
+
+        for obj in ordered:
             if not isinstance(obj, dict) or "type" not in obj or "plan" not in obj:
                 messages.append({
                     "role": "user",
-                    "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": "Invalid JSON schema; reply with one valid object."})
+                    "content": "TOOL_RESULT " + json.dumps({
+                        "ok": False,
+                        "error": "Invalid JSON schema; reply with one valid object.",
+                    }),
                 })
                 break
 
-            # Persist assistant JSON for continuity
             messages.append({"role": "assistant", "content": json.dumps(obj, ensure_ascii=False)})
 
-            # Apply files then patches (so patches can target freshly written files too)
             written, w_err = write_files_from_obj(obj, workdir)
             patched, p_err = apply_patches_from_obj(obj, workdir)
 
-            if written:
-                print("\n" + "=" * 50)
-                print("📄 FILES WRITTEN")
-                print("=" * 50)
-                for p in written:
-                    print(f"- {p}")
-                print("=" * 50 + "\n")
-
-            if patched:
-                print("\n" + "=" * 50)
-                print("🩹 PATCHES APPLIED")
-                print("=" * 50)
-                for p in patched:
-                    print(f"- {p}")
-                print("=" * 50 + "\n")
-
             if w_err or p_err:
-                print("\n" + "!" * 50)
-                print("⚠️ FILE/PATCH ERRORS")
-                print("!" * 50)
-                for e in (w_err + p_err):
-                    print(f"- {e}")
-                print("!" * 50 + "\n")
-
-                # Tell the model it must fix paths/diff/etc.
                 messages.append({
                     "role": "user",
                     "content": "TOOL_RESULT " + json.dumps({
@@ -499,112 +427,103 @@ def run_agent_turn(
                         "written": written,
                         "patched": patched,
                         "details": (w_err + p_err),
-                    })
+                    }),
                 })
                 break  # next round
 
             render_assistant(obj)
-
             typ = obj.get("type")
 
-            # If there is a tool object in the same response, ignore message objects here
-            if typ == "message" and any_tool_obj:
-                continue
-
-            # Guard: if user asked to compile/run/test and tool not yet executed/denied, force tool
-            if typ == "message" and need_tool and not tool_gate_open:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": "TOOL_RESULT "
-                        + json.dumps(
-                            {
-                                "ok": False,
-                                "error": "Tool is required. Reply with type='tool', tool='bash', and commands[] to compile/run/test. Do not guess outputs.",
-                            }
-                        ),
-                    }
-                )
-                break
-
             if typ == "message":
+                if need_tool and not tool_gate_open:
+                    messages.append({
+                        "role": "user",
+                        "content": "TOOL_RESULT " + json.dumps({
+                            "ok": False,
+                            "error": "Tool is required. Reply with type='tool', tool='bash', and commands[] to compile/run/test. Do not guess outputs.",
+                        }),
+                    })
+                    break
                 return
 
             if typ == "tool" and obj.get("tool") == "bash":
                 commands = obj.get("commands", [])
                 if not isinstance(commands, list) or not commands:
                     messages.append({
-                            "role": "user",
-                            "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": "missing commands[]"})
-                        })
+                        "role": "user",
+                        "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": "missing commands[]"}),
+                    })
                     break
 
-                # Runtime guards — do NOT open the tool gate on these rejections
+                # runtime guards (do NOT open tool gate on these)
+                guard_failed = False
                 for c in commands:
                     if len(c) > MAX_CMD_CHARS:
                         messages.append({
-                                "role": "user",
-                                "content": "TOOL_RESULT "
-                                + json.dumps({
-                                        "ok": False,
-                                        "error": f"Command too large ({len(c)} chars). Put code into files[] and use short commands for build/run.",
-                                    }),
-                            })
+                            "role": "user",
+                            "content": "TOOL_RESULT " + json.dumps({
+                                "ok": False,
+                                "error": f"Command too large ({len(c)} chars). Put code into files[] and use short commands for build/run.",
+                            }),
+                        })
+                        guard_failed = True
                         break
-                else:
-                    # Only reached if no breaks => guards passed
-                    print("!" * 50)
-                    print("⚠️  BASH TOOL REQUEST ⚠️")
-                    print("!" * 50)
-                    print(f"(cwd = {workdir})")
-                    for i, c in enumerate(commands, 1):
-                        print(f"{i}) {c}")
-                    print("!" * 50 + "\n")
-
-                    if no_confirm:
-                        confirm = "y"
-                    else:
-                        confirm = (input(f"Execute {len(commands)} command(s)? (y/N): ").strip().lower())
-
-                    if confirm != "y":
-                        print("Command(s) cancelled.\n")
+                    bad = _bad_edit_command(c)
+                    if bad:
                         messages.append({
                             "role": "user",
-                            "content": "TOOL_RESULT " + json.dumps({"ok": False, "denied": True})
+                            "content": "TOOL_RESULT " + json.dumps({
+                                "ok": False,
+                                "error": f"Do not use {bad} to edit code. Use patches[] instead.",
+                            }),
                         })
-                        
-                        # User denial opens the “you may answer without tool” gate
-                        tool_gate_open = True
+                        guard_failed = True
                         break
-
-                    results = []
-                    for c in commands:
-                        print(f"Executing: {c}")
-                        r = run_bash_command(c, cwd=workdir)
-                        results.append(r)
-                        if r["stdout"]:
-                            print("STDOUT:\n" + r["stdout"])
-                        if r["stderr"]:
-                            print("STDERR:\n" + r["stderr"])
-                        print(f"Return Code: {r['returncode']}\n")
-
-                    messages.append({
-                    "role": "user",
-                    "content": "TOOL_RESULT " + json.dumps({"ok": True, "results": results})
-                    })
-                    
-                    
-                    tool_gate_open = True
+                if guard_failed:
                     break  # next round
 
-                # If guard rejected a command (break inside guards), go next round
-                break
+                print("!" * 50)
+                print("⚠️  BASH TOOL REQUEST ⚠️")
+                print("!" * 50)
+                print(f"(cwd = {workdir})")
+                for i, c in enumerate(commands, 1):
+                    print(f"{i}) {c}")
+                print("!" * 50 + "\n")
 
+                if no_confirm:
+                    confirm = "y"
+                else:
+                    confirm = input(f"Execute {len(commands)} command(s)? (y/N): ").strip().lower()
+
+                if confirm != "y":
+                    print("Command(s) cancelled.\n")
+                    messages.append({
+                        "role": "user",
+                        "content": "TOOL_RESULT " + json.dumps({"ok": False, "denied": True}),
+                    })
+                    tool_gate_open = True  # denied => allow model to answer without tool
+                    break
+
+                results = []
+                for c in commands:
+                    r = run_bash_command(c, cwd=workdir)
+                    results.append(r)
+
+                messages.append({
+                    "role": "user",
+                    "content": "TOOL_RESULT " + json.dumps({"ok": True, "results": results}),
+                })
+                tool_gate_open = True  # executed => allow message response
+                break  # next round
+
+            # unknown type/tool
             messages.append({
                 "role": "user",
-                "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": "unknown tool/type; use type=message or type=tool(tool=bash)"})
+                "content": "TOOL_RESULT " + json.dumps({
+                    "ok": False,
+                    "error": "unknown tool/type; use type=message or type=tool(tool=bash)",
+                }),
             })
-            tool_gate_open = True
             break
 
     print("Agent: Reached tool-round limit.\n")
@@ -626,6 +545,7 @@ def main():
                    help="DANGER: Execute bash commands without confirmation.")
     p.add_argument("--no-json-schema", action="store_true",
                    help="Do not try response_format json_schema (use json_object / prompt-only).")
+    p.add_argument("--debug", action="store_true", help="Print raw model outputs (truncated).")
     args = p.parse_args()
 
     model = args.model
@@ -655,7 +575,6 @@ def main():
 
     workspace = tempfile.TemporaryDirectory(prefix="ai-bash-agent-")
     print(f"Workspace: {workspace.name}\n")
-
     print("Type 'exit' to quit, 'clear' to clear context (and reset workspace), 'status' to show status.\n")
 
     try:
@@ -679,21 +598,6 @@ def main():
                 if user_input.lower() == "status":
                     print(f"Server: {args.server} | Model: {model} | Messages: {len(messages)}")
                     print(f"Workspace: {workspace.name}\n")
-                    # optionally list workspace files
-                    try:
-                        ws = Path(workspace.name)
-                        files = [str(p.relative_to(ws)) for p in ws.rglob("*") if p.is_file()]
-                        if files:
-                            print("Workspace files:")
-                            for f in sorted(files)[:50]:
-                                print(f"- {f}")
-                            if len(files) > 50:
-                                print(f"... ({len(files)-50} more)")
-                        else:
-                            print("Workspace files: (none)")
-                        print()
-                    except Exception:
-                        pass
                     continue
 
                 run_agent_turn(
@@ -704,9 +608,9 @@ def main():
                     temperature=args.temp,
                     no_confirm=args.no_confirm,
                     workdir=workspace.name,
+                    debug=args.debug,
                 )
 
-                # Keep system + last 20 messages
                 if len(messages) > 21:
                     messages = [messages[0]] + messages[-20:]
 
