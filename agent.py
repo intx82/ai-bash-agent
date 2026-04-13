@@ -594,6 +594,17 @@ def main():
                     workspace = tempfile.TemporaryDirectory(prefix="ai-bash-agent-")
                     print(f"Context cleared.\nWorkspace reset:\n  old: {old}\n  new: {workspace.name}\n")
                     continue
+                
+                if user_input.lower() == "save":
+                    with open('ctx.json', 'wt') as fd:
+                        json.dump(messages,fd)
+                    print('Context saved')
+                    continue
+
+                if user_input.lower() == "load":
+                    with open('ctx.json', 'rt') as fd:
+                        messages = json.load(fd)
+                    print('Context loaded')
 
                 if user_input.lower() == "status":
                     print(f"Server: {args.server} | Model: {model} | Messages: {len(messages)}")
