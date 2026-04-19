@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from mcp_bridge import MCPBridge, MCPBridgeConfig
 from llm_backends import BackendConfig, make_backend
 
 
@@ -19,18 +20,19 @@ DEFAULT_MODEL_OPENAI = "gpt-5.4"  # change as you like
 
 
 SYSTEM_PROMPT = r"""
-You are a helpful AI assistant with access to a local bash tool.
+You are a helpful AI assistant with access to tools.
 
 You MUST respond with EXACTLY ONE JSON object and NOTHING ELSE.
 NO markdown fences. NEVER output ```.
 Output must be valid JSON parsable by json.loads().
 Do not include any text before or after the JSON object.
 
-Allowed top-level keys are: type, plan, message, tool, commands, files, patches.
-
-When emitting shell commands containing regex, ensure the JSON remains valid by escaping backslashes for JSON.
-Example:
-grep -oP '(\\d{1,2}:\\d{2})'
+Allowed top-level keys are:
+type, plan, message,
+tool,
+commands,
+name, arguments,
+files, patches.
 
 Schema:
 {
@@ -46,8 +48,11 @@ Schema:
     {"path": "relative/path.ext", "diff": "unified diff string"}
   ],
 
-  "tool": "bash",
-  "commands": ["cmd1", "cmd2"]
+  "tool": "bash" | "mcp",
+
+  "commands": ["cmd1", "cmd2"],          // only when tool == "bash"
+  "name": "read_text|write_text|apply_unified_patch|run_bash",   // only when tool == "mcp"
+  "arguments": { ... }                    // only when tool == "mcp"
 }
 
 Rules:
@@ -55,10 +60,16 @@ Rules:
 - NEVER claim a tool error unless you received a TOOL_RESULT that shows an error.
 - If the user asks to compile/run/test/execute/verify, you MUST respond with type="tool" first.
 - If type == "tool", output ONLY the tool JSON (do not include a final answer in the same reply).
-- If you need to publish code/markdown: put it ONLY in files[].content (NOT in message).
-- For modifying existing files: use patches[] (NOT sed/perl -pi).
-- For writing new files: use files[] (NOT sed/echo/python/cat heredocs).
-- Bash commands run in a temporary working directory (empty sandbox). Use relative paths and create files there.
+- Prefer tool="mcp" for file operations: read_text/write_text/apply_unified_patch.
+- For ANY file operation (check existence, list files, read, write, edit, apply patch), you MUST use tool="mcp".
+  Use these MCP tools:
+  - read_text(path)
+  - write_text(path, content, overwrite=true|false)
+  - apply_unified_patch(diff, strip=0|1)
+- tool="bash" is ONLY for compiling/running/testing programs (gcc, make, pytest, etc).
+- You MUST NOT use bash for: cat, ls, grep, sed, awk, perl, patch, echo > file, or any file editing.
+- If you need to inspect file contents, use mcp.read_text.
+- If you need to search inside files, use mcp.read_text then reason, or ask for permission to add a search tool.
 - Avoid dangerous commands unless user explicitly requests and confirms.
 - If the user asks found something in the internet use DuckDuckGo (`ddgr [QUERY] --np --json`). 
 
@@ -77,7 +88,7 @@ DuckDuckGo (ddgr) Output JSON will have next schema:
 """
 
 MAX_TOOL_ROUNDS = 32
-MAX_CMD_CHARS = 4000
+MAX_CMD_CHARS = 8000
 
 
 def user_requires_tool(user_input: str) -> bool:
@@ -111,11 +122,6 @@ def strip_code_fences(text: str) -> str:
 
 
 def parse_assistant_json_objects(raw: str) -> Optional[List[Dict[str, Any]]]:
-    """
-    Parses one or more JSON objects concatenated together (NDJSON-ish).
-    Returns a list of dicts, or None if parsing fails.
-    Never raises.
-    """
     if raw is None:
         return None
 
@@ -125,7 +131,6 @@ def parse_assistant_json_objects(raw: str) -> Optional[List[Dict[str, Any]]]:
     i = 0
     objs: List[Dict[str, Any]] = []
 
-    # raw-decode loop (best for {}{} or {}\n{} cases)
     try:
         while i < len(txt):
             while i < len(txt) and txt[i].isspace():
@@ -141,7 +146,6 @@ def parse_assistant_json_objects(raw: str) -> Optional[List[Dict[str, Any]]]:
     except Exception:
         pass
 
-    # fallback: extract first {...} or whole string
     try:
         s = txt.find("{")
         e = txt.rfind("}")
@@ -149,7 +153,6 @@ def parse_assistant_json_objects(raw: str) -> Optional[List[Dict[str, Any]]]:
             obj = json.loads(txt[s : e + 1])
             if isinstance(obj, dict):
                 return [obj]
-        # Final fallback: whole string
         obj = json.loads(txt)
         if isinstance(obj, dict):
             return [obj]
@@ -162,10 +165,10 @@ def parse_assistant_json_objects(raw: str) -> Optional[List[Dict[str, Any]]]:
 def _is_safe_relative_path(p: str) -> bool:
     if not p or not isinstance(p, str):
         return False
-    # if p.startswith(("/", "~")):
-    #     return False
-    # if re.match(r"^[A-Za-z]:[\\/]", p):  # Windows drive letters
-    #     return False
+    if p.startswith(("/", "~")):
+        return False
+    if re.match(r"^[A-Za-z]:[\\/]", p):  # Windows drive letters
+        return False
     pp = Path(p)
     if any(part == ".." for part in pp.parts):
         return False
@@ -173,20 +176,14 @@ def _is_safe_relative_path(p: str) -> bool:
 
 
 def write_files_from_obj(obj: Dict[str, Any], workdir: str) -> Tuple[List[str], List[str]]:
-    """
-    Writes obj["files"] to workdir (safe relative paths only).
-    Returns (written_paths, error_messages).
-    """
     files = obj.get("files")
     if not files:
         return ([], [])
-
     if not isinstance(files, list):
         return ([], ["files must be an array"])
 
     written: List[str] = []
     errors: List[str] = []
-
     root = Path(workdir).resolve()
 
     for idx, item in enumerate(files):
@@ -335,16 +332,16 @@ def render_assistant(obj: Dict[str, Any]) -> None:
         print(f"\nAgent: {msg}\n")
 
 
-def _bad_edit_command(cmd: str) -> Optional[str]:
-    if re.search(r"\bsed\s+-i\b", cmd):
-        return "sed -i"
-    if re.search(r"\bperl\s+-pi\b", cmd):
-        return "perl -pi"
-    return None
+def _confirm(prompt: str, no_confirm: bool) -> bool:
+    if no_confirm:
+        return True
+    ans = input(prompt).strip().lower()
+    return ans == "y"
 
 
 def run_agent_turn(
     backend: Any,
+    mcp: MCPBridge,
     messages: List[Dict[str, str]],
     user_input: str,
     max_tokens: int,
@@ -356,20 +353,20 @@ def run_agent_turn(
     messages.append({"role": "user", "content": user_input})
     need_tool = user_requires_tool(user_input)
 
-    # gate becomes True only after bash executed or explicitly denied
+    # tool gate becomes True only after tool executed or explicitly denied
     tool_gate_open = not need_tool
 
     for _round in range(MAX_TOOL_ROUNDS):
         raw = backend.chat_completion(messages=messages, max_tokens=max_tokens, temperature=temperature)
-
         if raw is None:
             print("✗ No response from model.")
             return
 
         if debug:
-            print(f"---- RAW (first 1000) ----\n{raw[:1000]}\n-------------------------")
+            print("---------- RAW -----------")
+            print(raw[:2000])
+            print("--------------------------")
 
-        # Empty completion is a real case. Treat it as "retry", not protocol violation.
         if raw.strip() == "":
             messages.append({
                 "role": "user",
@@ -382,7 +379,6 @@ def run_agent_turn(
 
         objs = parse_assistant_json_objects(raw)
         if not objs:
-            # Do NOT add a system message (it grows prompts and hurts behavior).
             messages.append({
                 "role": "user",
                 "content": "TOOL_RESULT " + json.dumps({
@@ -393,14 +389,11 @@ def run_agent_turn(
             })
             continue
 
-        # If any tool object exists, prioritize tool objects and ignore message objects in this reply.
-        tool_objs = [o for o in objs if isinstance(o, dict) and o.get("type") == "tool" and o.get("tool") == "bash"]
-        any_tool_obj = bool(tool_objs)
-
-        if len(objs) > 1 and any_tool_obj:
+        # prioritize tool objects if present
+        tool_objs = [o for o in objs if isinstance(o, dict) and o.get("type") == "tool"]
+        ordered = tool_objs if tool_objs else objs
+        if len(objs) > 1 and tool_objs:
             print("⚠️ Multiple JSON objects received; prioritizing tool request.\n")
-
-        ordered = tool_objs if any_tool_obj else objs
 
         for obj in ordered:
             if not isinstance(obj, dict) or "type" not in obj or "plan" not in obj:
@@ -440,93 +433,104 @@ def run_agent_turn(
                         "role": "user",
                         "content": "TOOL_RESULT " + json.dumps({
                             "ok": False,
-                            "error": "Tool is required. Reply with type='tool', tool='bash', and commands[] to compile/run/test. Do not guess outputs.",
+                            "error": "Tool is required. Reply with type='tool' first to compile/run/test; do not guess outputs.",
                         }),
                     })
                     break
                 return
 
-            if typ == "tool" and obj.get("tool") == "bash":
-                commands = obj.get("commands", [])
-                if not isinstance(commands, list) or not commands:
-                    messages.append({
-                        "role": "user",
-                        "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": "missing commands[]"}),
-                    })
+            # TOOL dispatch
+            if typ == "tool":
+                tool = obj.get("tool")
+
+                # ---- bash tool (local) ----
+                if tool == "bash":
+                    commands = obj.get("commands", [])
+                    if not isinstance(commands, list) or not commands:
+                        messages.append({"role": "user", "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": "missing commands[]"})})
+                        break
+
+                    for c in commands:
+                        if not isinstance(c, str) or len(c) > MAX_CMD_CHARS:
+                            messages.append({"role": "user", "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": "invalid/too large command"})})
+                            break
+                    else:
+                        print("!" * 50)
+                        print("⚠️  BASH TOOL REQUEST ⚠️")
+                        print("!" * 50)
+                        print(f"(cwd = {workdir})")
+                        for i, c in enumerate(commands, 1):
+                            print(f"{i}) {c}")
+                        print("!" * 50 + "\n")
+
+                        if not _confirm(f"Execute {len(commands)} command(s)? (y/N): ", no_confirm):
+                            print("Command(s) cancelled.\n")
+                            messages.append({"role": "user", "content": "TOOL_RESULT " + json.dumps({"ok": False, "denied": True})})
+                            tool_gate_open = True
+                            break
+
+                        results = [run_bash_command(c, cwd=workdir) for c in commands]
+                        messages.append({"role": "user", "content": "TOOL_RESULT " + json.dumps({"ok": True, "results": results})})
+                        tool_gate_open = True
+                        break
+
+                    # if validation broke out above
+                    tool_gate_open = tool_gate_open  # unchanged
                     break
 
-                # runtime guards (do NOT open tool gate on these)
-                guard_failed = False
-                for c in commands:
-                    if len(c) > MAX_CMD_CHARS:
-                        messages.append({
-                            "role": "user",
-                            "content": "TOOL_RESULT " + json.dumps({
-                                "ok": False,
-                                "error": f"Command too large ({len(c)} chars). Put code into files[] and use short commands for build/run.",
-                            }),
-                        })
-                        guard_failed = True
+                # ---- mcp tool ----
+                if tool == "mcp":
+                    name = obj.get("name")
+                    arguments = obj.get("arguments", {})
+                    if not isinstance(name, str) or not isinstance(arguments, dict):
+                        messages.append({"role": "user", "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": "mcp tool requires name(str) and arguments(object)"})})
                         break
-                    bad = _bad_edit_command(c)
-                    if bad:
-                        messages.append({
-                            "role": "user",
-                            "content": "TOOL_RESULT " + json.dumps({
-                                "ok": False,
-                                "error": f"Do not use {bad} to edit code. Use patches[] instead.",
-                            }),
-                        })
-                        guard_failed = True
+
+                    # confirm potentially mutating tools
+                    needs_confirm = name in ("write_text", "apply_unified_patch", "run_bash")
+                    print("!" * 50)
+                    print("⚠️  MCP TOOL REQUEST ⚠️")
+                    print("!" * 50)
+                    print(f"name: {name}")
+                    print(f"arguments: {json.dumps(arguments, ensure_ascii=False)[:2000]}")
+                    print("!" * 50 + "\n")
+
+                    if needs_confirm and not _confirm("Execute this MCP tool? (y/N): ", no_confirm):
+                        print("MCP tool cancelled.\n")
+                        messages.append({"role": "user", "content": "TOOL_RESULT " + json.dumps({"ok": False, "denied": True})})
+                        tool_gate_open = True
                         break
-                if guard_failed:
-                    break  # next round
 
-                print("!" * 50)
-                print("⚠️  BASH TOOL REQUEST ⚠️")
-                print("!" * 50)
-                print(f"(cwd = {workdir})")
-                for i, c in enumerate(commands, 1):
-                    print(f"{i}) {c}")
-                print("!" * 50 + "\n")
+                    try:
+                        res = mcp.call_tool(name, arguments)
+                        messages.append({"role": "user", "content": "TOOL_RESULT " + json.dumps({"ok": True, "tool": "mcp", "name": name, "result": res})})
+                        tool_gate_open = True
+                        break
+                    except Exception as e:
+                        messages.append({"role": "user", "content": "TOOL_RESULT " + json.dumps({"ok": False, "tool": "mcp", "name": name, "error": str(e)})})
+                        break
 
-                if no_confirm:
-                    confirm = "y"
-                else:
-                    confirm = input(f"Execute {len(commands)} command(s)? (y/N): ").strip().lower()
+                # unknown tool
+                messages.append({"role": "user", "content": "TOOL_RESULT " + json.dumps({"ok": False, "error": f"unknown tool: {tool}"})})
+                break
 
-                if confirm != "y":
-                    print("Command(s) cancelled.\n")
-                    messages.append({
-                        "role": "user",
-                        "content": "TOOL_RESULT " + json.dumps({"ok": False, "denied": True}),
-                    })
-                    tool_gate_open = True  # denied => allow model to answer without tool
-                    break
-
-                results = []
-                for c in commands:
-                    r = run_bash_command(c, cwd=workdir)
-                    results.append(r)
-
-                messages.append({
-                    "role": "user",
-                    "content": "TOOL_RESULT " + json.dumps({"ok": True, "results": results}),
-                })
-                tool_gate_open = True  # executed => allow message response
-                break  # next round
-
-            # unknown type/tool
-            messages.append({
-                "role": "user",
-                "content": "TOOL_RESULT " + json.dumps({
-                    "ok": False,
-                    "error": "unknown tool/type; use type=message or type=tool(tool=bash)",
-                }),
-            })
-            break
+        # next round continues here
 
     print("Agent: Reached tool-round limit.\n")
+
+
+def _start_mcp_for_workspace(workspace_dir: str) -> MCPBridge:
+    server_script = Path(__file__).resolve().with_name("mcp_server.py")
+    if not server_script.exists():
+        raise RuntimeError(f"mcp_server.py not found next to agent.py: {server_script}")
+
+    mcp = MCPBridge(MCPBridgeConfig(
+        command="python3",
+        args=[str(server_script)],
+        env={"MCP_ROOT": workspace_dir},
+    ))
+    mcp.start()
+    return mcp
 
 
 def main():
@@ -542,7 +546,7 @@ def main():
     p.add_argument("--max-tokens", type=int, default=4096)
     p.add_argument("--temp", type=float, default=0.7)
     p.add_argument("--no-confirm", action="store_true",
-                   help="DANGER: Execute bash commands without confirmation.")
+                   help="DANGER: Execute tools without confirmation.")
     p.add_argument("--no-json-schema", action="store_true",
                    help="Do not try response_format json_schema (use json_object / prompt-only).")
     p.add_argument("--debug", action="store_true", help="Print raw model outputs (truncated).")
@@ -561,7 +565,7 @@ def main():
     )
     backend = make_backend(cfg)
 
-    print("\n=== AI Bash Agent ===")
+    print("\n=== AI Bash Agent (MCP-enabled) ===")
     print(f"Backend: {args.server} | Model: {model}")
     if args.server == "llama.cpp":
         print(f"URL: {args.url}")
@@ -574,8 +578,10 @@ def main():
     messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     workspace = tempfile.TemporaryDirectory(prefix="ai-bash-agent-")
-    print(f"Workspace: {workspace.name}\n")
-    print("Type 'exit' to quit, 'clear' to clear context (and reset workspace), 'status' to show status.\n")
+    mcp = _start_mcp_for_workspace(workspace.name)
+
+    print(f"Workspace: {workspace.name}")
+    print("Type 'exit' to quit, 'clear' to clear context (and reset workspace+mcp), 'status' to show status.\n")
 
     try:
         while True:
@@ -590,11 +596,18 @@ def main():
                 if user_input.lower() == "clear":
                     messages = messages[:1]
                     old = workspace.name
+
+                    try:
+                        mcp.close()
+                    except Exception:
+                        pass
                     workspace.cleanup()
+
                     workspace = tempfile.TemporaryDirectory(prefix="ai-bash-agent-")
+                    mcp = _start_mcp_for_workspace(workspace.name)
+
                     print(f"Context cleared.\nWorkspace reset:\n  old: {old}\n  new: {workspace.name}\n")
                     continue
-                
                 if user_input.lower() == "save":
                     with open('ctx.json', 'wt') as fd:
                         json.dump(messages,fd)
@@ -613,6 +626,7 @@ def main():
 
                 run_agent_turn(
                     backend=backend,
+                    mcp=mcp,
                     messages=messages,
                     user_input=user_input,
                     max_tokens=args.max_tokens,
@@ -629,6 +643,10 @@ def main():
                 print("\nExiting...")
                 break
     finally:
+        try:
+            mcp.close()
+        except Exception:
+            pass
         try:
             workspace.cleanup()
         except Exception:

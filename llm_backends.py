@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -12,11 +11,11 @@ import requests
 # --------------------------
 # Agent response schema (strict)
 # --------------------------
-# IMPORTANT: don't put additionalProperties: false at the top-level with oneOf here.
-# Keep strictness inside each oneOf branch instead.
+# Updated: supports tool="bash" and tool="mcp" (with name/arguments).
 AGENT_RESPONSE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "oneOf": [
+        # message
         {
             "type": "object",
             "additionalProperties": False,
@@ -45,13 +44,15 @@ AGENT_RESPONSE_SCHEMA: Dict[str, Any] = {
             },
             "required": ["type", "plan", "message"],
         },
+
+        # tool: bash
         {
             "type": "object",
             "additionalProperties": False,
             "properties": {
                 "type": {"type": "string", "const": "tool"},
                 "plan": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
-                "tool": {"type": "string", "enum": ["bash"]},
+                "tool": {"type": "string", "const": "bash"},
                 "commands": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                 "message": {"type": "string"},
                 "files": {
@@ -74,6 +75,21 @@ AGENT_RESPONSE_SCHEMA: Dict[str, Any] = {
                 },
             },
             "required": ["type", "plan", "tool", "commands"],
+        },
+
+        # tool: mcp
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "type": {"type": "string", "const": "tool"},
+                "plan": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
+                "tool": {"type": "string", "const": "mcp"},
+                "name": {"type": "string"},
+                "arguments": {"type": "object"},
+                "message": {"type": "string"},
+            },
+            "required": ["type", "plan", "tool", "name", "arguments"],
         },
     ],
 }
@@ -106,16 +122,16 @@ class ChatBackend(Protocol):
 
 @dataclass
 class BackendConfig:
-    server: str                      # "llama.cpp" or "chatgpt"
+    server: str
     model: str
-    url: str                         # used for llama.cpp
-    api_key: Optional[str] = None    # used for llama.cpp (optional)
-    prefer_json_schema: bool = True  # try json_schema first when available
+    url: str
+    api_key: Optional[str] = None
+    prefer_json_schema: bool = True
     request_timeout_s: int = 4800
 
 
 # --------------------------
-# llama.cpp backend (OpenAI-compatible endpoint)
+# llama.cpp backend
 # --------------------------
 
 class LlamaCppBackend:
@@ -163,17 +179,13 @@ class LlamaCppBackend:
             "stream": False,
         }
 
-        # With and without slot pinning (fallback if unsupported)
         bases: List[Dict[str, Any]] = []
-
         with_slot = dict(base_payload)
         with_slot["id_slot"] = self.id_slot
         with_slot["cache_prompt"] = self.cache_prompt
         bases.append(with_slot)
-
         bases.append(base_payload)
 
-        # response_format variants (fallback to None)
         rfs: List[Optional[Dict[str, Any]]] = []
         if self.cfg.prefer_json_schema:
             rfs.append(AGENT_RESPONSE_FORMAT_JSON_SCHEMA)
@@ -181,7 +193,6 @@ class LlamaCppBackend:
         rfs.append(None)
 
         last_err: Optional[str] = None
-
         for base in bases:
             for rf in rfs:
                 payload = dict(base)
@@ -196,7 +207,6 @@ class LlamaCppBackend:
                         continue
                     data = r.json()
                     content = data["choices"][0]["message"].get("content", "")
-                    # content can legitimately be "" (EOS immediately)
                     return content if isinstance(content, str) else ""
                 except Exception as e:
                     last_err = str(e)
@@ -206,24 +216,16 @@ class LlamaCppBackend:
 
 
 # --------------------------
-# OpenAI / ChatGPT backend (official SDK)
+# OpenAI backend
 # --------------------------
 
 class OpenAIChatGPTBackend:
-    """
-    Uses the official openai Python SDK (OpenAI()).
-    API key from OPENAI_API_KEY env var.
-    """
-
     def __init__(self, cfg: BackendConfig):
         self.cfg = cfg
         try:
             from openai import OpenAI  # type: ignore
         except Exception as e:
-            raise RuntimeError(
-                "OpenAI backend selected, but python module 'openai' is not installed. "
-                "Install it with: pip install openai"
-            ) from e
+            raise RuntimeError("OpenAI backend selected but 'openai' module is not installed.") from e
 
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
