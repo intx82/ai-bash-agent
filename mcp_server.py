@@ -19,14 +19,26 @@ MAX_CMD_CHARS = int(os.environ.get("MCP_MAX_CMD_CHARS", "4000"))
 ALLOW_DANGEROUS = os.environ.get("MCP_ALLOW_DANGEROUS", "0") == "1"
 
 
+def _root() -> Path:
+    return Path(os.environ.get("MCP_ROOT", ".")).resolve()
+
 def _safe_relpath(path: str) -> Path:
+    root = _root()
+
     if not isinstance(path, str) or not path:
         raise ValueError("path must be a non-empty string")
+
     p = Path(path)
+    if path.startswith(("/", "~")):
+        return p
+
     if any(part == ".." for part in p.parts):
         raise ValueError(".. is not allowed in path")
-    return p
 
+    full = (root / p).resolve()
+    if not str(full).startswith(str(root)):
+        raise ValueError("path escapes MCP_ROOT")
+    return full
 
 def _dangerous_cmd(cmd: str) -> Optional[str]:
     s = cmd.strip()

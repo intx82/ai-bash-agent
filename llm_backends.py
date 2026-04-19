@@ -8,82 +8,56 @@ from typing import Any, Dict, List, Optional, Protocol
 import requests
 
 
-# --------------------------
-# Agent response schema (strict)
-# --------------------------
-# Updated: supports tool="bash" and tool="mcp" (with name/arguments).
 AGENT_RESPONSE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "oneOf": [
-        # message
         {
             "type": "object",
             "additionalProperties": False,
             "properties": {
                 "type": {"type": "string", "const": "message"},
-                "plan": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
+                "plan": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 3,
+                },
                 "message": {"type": "string"},
-                "files": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                        "required": ["path", "content"],
-                    },
-                },
-                "patches": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {"path": {"type": "string"}, "diff": {"type": "string"}},
-                        "required": ["path", "diff"],
-                    },
-                },
             },
             "required": ["type", "plan", "message"],
         },
-
-        # tool: bash
         {
             "type": "object",
             "additionalProperties": False,
             "properties": {
                 "type": {"type": "string", "const": "tool"},
-                "plan": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
+                "plan": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 3,
+                },
                 "tool": {"type": "string", "const": "bash"},
-                "commands": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "commands": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                },
                 "message": {"type": "string"},
-                "files": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                        "required": ["path", "content"],
-                    },
-                },
-                "patches": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {"path": {"type": "string"}, "diff": {"type": "string"}},
-                        "required": ["path", "diff"],
-                    },
-                },
             },
             "required": ["type", "plan", "tool", "commands"],
         },
-
-        # tool: mcp
         {
             "type": "object",
             "additionalProperties": False,
             "properties": {
                 "type": {"type": "string", "const": "tool"},
-                "plan": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3},
+                "plan": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 3,
+                },
                 "tool": {"type": "string", "const": "mcp"},
                 "name": {"type": "string"},
                 "arguments": {"type": "object"},
@@ -106,10 +80,6 @@ AGENT_RESPONSE_FORMAT_JSON_SCHEMA: Dict[str, Any] = {
 AGENT_RESPONSE_FORMAT_JSON_OBJECT: Dict[str, Any] = {"type": "json_object"}
 
 
-# --------------------------
-# Backend interface
-# --------------------------
-
 class ChatBackend(Protocol):
     def check_connection(self) -> bool: ...
     def chat_completion(
@@ -130,19 +100,7 @@ class BackendConfig:
     request_timeout_s: int = 4800
 
 
-# --------------------------
-# llama.cpp backend
-# --------------------------
-
 class LlamaCppBackend:
-    """
-    OpenAI-compatible llama.cpp /v1/chat/completions backend using requests.Session() (keep-alive).
-
-    Robustness improvements:
-    - Try with id_slot/cache_prompt, then retry without them (some builds reject these params).
-    - Try response_format json_schema/json_object, then retry without response_format.
-    """
-
     def __init__(self, cfg: BackendConfig):
         self.cfg = cfg
         self.session = requests.Session()
@@ -215,24 +173,24 @@ class LlamaCppBackend:
         return None
 
 
-# --------------------------
-# OpenAI backend
-# --------------------------
-
 class OpenAIChatGPTBackend:
     def __init__(self, cfg: BackendConfig):
         self.cfg = cfg
         try:
             from openai import OpenAI  # type: ignore
         except Exception as e:
-            raise RuntimeError("OpenAI backend selected but 'openai' module is not installed.") from e
+            raise RuntimeError("OpenAI backend selected, but python module 'openai' is not installed.") from e
 
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY env var is not set.")
 
         base_url = os.environ.get("OPENAI_BASE_URL")
-        self.client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+        self.client = (
+            OpenAI(api_key=api_key, base_url=base_url)
+            if base_url
+            else OpenAI(api_key=api_key)
+        )
 
     def check_connection(self) -> bool:
         try:
@@ -265,7 +223,11 @@ class OpenAIChatGPTBackend:
         for rf in response_format_variants:
             for pv in param_variants:
                 try:
-                    kwargs: Dict[str, Any] = {"model": self.cfg.model, "messages": messages, **pv}
+                    kwargs: Dict[str, Any] = {
+                        "model": self.cfg.model,
+                        "messages": messages,
+                        **pv,
+                    }
                     if rf is not None:
                         kwargs["response_format"] = rf
                     completion = self.client.chat.completions.create(**kwargs)
