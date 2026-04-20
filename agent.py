@@ -42,7 +42,7 @@ Schema:
 
   "tool": "mcp" | "bash",
 
-  "name": "read_text|write_text|apply_unified_patch|run_bash",   // only when tool == "mcp"
+  "name": "read_text|write_text|replace_in_file|run_bash",   // only when tool == "mcp"
   "arguments": { ... },                                          // only when tool == "mcp"
 
   "commands": ["cmd1", "cmd2"]                                   // only when tool == "bash"
@@ -53,8 +53,9 @@ Tool policy:
 - Use these MCP tools:
   - read_text(path)
   - write_text(path, content, overwrite=true|false)
-  - apply_unified_patch(diff, strip=0|1)
+  - replace_in_file(path, old, new, count: int = 1)
   - run_bash(command, timeout_s=300)
+- Prefer replace_in_file for targeted edits to existing files. If changing file with this tool fails, use 'read_text' and 'write_text' dividing changes by chunks in 8kbytes. 
 - Use tool="bash" ONLY for compiling/running/testing programs.
 - You MUST NOT use bash for: cat, ls, find, grep, sed, awk, perl, patch, echo > file, cp, mv, rm, touch, mkdir, rmdir.
 - If the user asks to compile/run/test/execute/verify, you MUST respond with type="tool" first.
@@ -367,7 +368,7 @@ def run_agent_turn(
                                 + json.dumps(
                                     {
                                         "ok": False,
-                                        "error": "Bash is not allowed for file operations. Use MCP tools instead: read_text/write_text/apply_unified_patch.",
+                                        "error": "Bash is not allowed for file operations. Use MCP tools instead: read_text/write_text/replace_in_file.",
                                     }
                                 ),
                             }
@@ -449,7 +450,7 @@ def run_agent_turn(
 
                     needs_confirm = name in (
                         "write_text",
-                        "apply_unified_patch",
+                        "replace_in_file",
                         "run_bash",
                     )
 

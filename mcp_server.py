@@ -36,8 +36,6 @@ def _safe_relpath(path: str) -> Path:
         raise ValueError(".. is not allowed in path")
 
     full = (root / p).resolve()
-    if not str(full).startswith(str(root)):
-        raise ValueError("path escapes MCP_ROOT")
     return full
 
 def _dangerous_cmd(cmd: str) -> Optional[str]:
@@ -79,6 +77,15 @@ def write_text(path: str, content: str, overwrite: bool = True) -> Dict[str, Any
     full.write_bytes(raw)
     return {"ok": True, "path": path, "bytes_written": len(raw)}
 
+@mcp.tool()
+def replace_in_file(path: str, old: str, new: str, count: int = 1) -> Dict[str, Any]:
+    full = _safe_relpath(path)
+    text = full.read_text(encoding="utf-8")
+    if old not in text:
+        raise ValueError("old text not found in file")
+    updated = text.replace(old, new, count)
+    full.write_text(updated, encoding="utf-8")
+    return {"ok": True, "path": path, "replaced": count}
 
 @mcp.tool()
 def apply_unified_patch(diff: str, strip: int = 0) -> Dict[str, Any]:
@@ -93,8 +100,11 @@ def apply_unified_patch(diff: str, strip: int = 0) -> Dict[str, Any]:
     except Exception:
         raise RuntimeError("patch(1) not found; install 'patch'")
 
+    if not diff.endswith("\n"):
+        diff += "\n"
+
     r = subprocess.run(
-        ["patch", f"-p{strip}", "--forward", "--batch"],
+        ["patch", f"-p{strip}"],
         cwd=str(ROOT),
         input=diff,
         capture_output=True,
