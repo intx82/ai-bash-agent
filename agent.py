@@ -42,7 +42,7 @@ Schema:
 
   "tool": "mcp" | "bash",
 
-  "name": "read_text|write_text|replace_in_file|run_bash",   // only when tool == "mcp"
+  "name": "read_text|write_text|replace_in_file|run_bash|ask_big_brother",   // only when tool == "mcp"
   "arguments": { ... },                                          // only when tool == "mcp"
 
   "commands": ["cmd1", "cmd2"]                                   // only when tool == "bash"
@@ -55,14 +55,17 @@ Tool policy:
   - write_text(path, content, overwrite=true|false)
   - replace_in_file(path, old, new, count: int = 1)
   - run_bash(command, timeout_s=300)
+  - ask_big_brother(question)
 - Prefer replace_in_file for targeted edits to existing files. If changing file with this tool fails, use 'read_text' and 'write_text' dividing changes by chunks in 8kbytes. 
 - Use tool="bash" ONLY for compiling/running/testing programs.
+- Use ask_big_brother when you need current facts, manuals, package docs, or web research.
 - You MUST NOT use bash for: cat, ls, find, grep, sed, awk, perl, patch, echo > file, cp, mv, rm, touch, mkdir, rmdir.
 - If the user asks to compile/run/test/execute/verify, you MUST respond with type="tool" first.
 - If type == "tool", output ONLY the tool JSON (do not include a final answer in the same reply).
 - NEVER claim a tool error unless you received a TOOL_RESULT that shows an error.
 - Avoid dangerous commands unless user explicitly requests and confirms.
 - If the user asks found something in the internet use DuckDuckGo (`ddgr [QUERY] --np --json`). 
+- If the user asks to read the internet page use 'elinks --dump [URL]' or 'curl [URL]'
 
 DuckDuckGo (ddgr) Output JSON will have next schema:
 
@@ -74,11 +77,10 @@ DuckDuckGo (ddgr) Output JSON will have next schema:
   },
 ]
 
-- If there is a need to fetch page from internet use a 'curl' and 'wget' tools, and then parse the output.
-- If you don't know something or need to proof it, use DuckDuckGo to search additional information
+- If you don't know something or need to proof it first use ask_big_brother and then use DuckDuckGo to search additional information
 """
 
-MAX_TOOL_ROUNDS = 32
+MAX_TOOL_ROUNDS = 64
 MAX_CMD_CHARS = 8000
 
 

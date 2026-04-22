@@ -142,6 +142,58 @@ def run_bash(command: str, timeout_s: int = 300) -> Dict[str, Any]:
     return {"command": command, "cwd": str(ROOT), "stdout": r.stdout, "stderr": r.stderr, "returncode": r.returncode}
 
 
+@mcp.tool()
+def ask_big_brother(question: str) -> Dict[str, Any]:
+    """Ask OpenAI with web search enabled for current facts/manuals/docs."""
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("question must be a non-empty string")
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY env var is not set")
+
+    model = os.environ.get("BIG_BROTHER_MODEL", "gpt-5.4")
+
+    try:
+        from openai import OpenAI  # type: ignore
+    except Exception as e:
+        raise RuntimeError("python package 'openai' is not installed") from e
+
+    client = OpenAI(api_key=api_key)
+
+    response = client.responses.create(
+        model=model,
+        input=question,
+        tools=[{"type": "web_search_preview"}],
+        include=["web_search_call.action.sources"],
+    )
+
+    answer = getattr(response, "output_text", "") or ""
+
+    # best-effort extraction of sources from the response payload
+    sources = []
+    try:
+        payload = response.model_dump()
+        for item in payload.get("output", []):
+            if item.get("type") == "web_search_call":
+                action = item.get("action", {})
+                for src in action.get("sources", []):
+                    if isinstance(src, dict):
+                        sources.append({
+                            "title": src.get("title"),
+                            "url": src.get("url"),
+                        })
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "model": model,
+        "question": question,
+        "answer": answer,
+        "sources": sources,
+    }
+
 def main() -> None:
     # Direct execution: stdio server (this is the “simple run it as a script” mode). :contentReference[oaicite:1]{index=1}
     mcp.run()
