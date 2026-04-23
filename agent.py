@@ -251,15 +251,27 @@ def run_agent_turn(
     tool_gate_open = not need_tool
 
     for _round in range(MAX_TOOL_ROUNDS):
-        raw = backend.chat_completion(
+        resp = backend.chat_completion(
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
         )
-
-        if raw is None:
+        
+        if resp is None:
             print("✗ No response from model.")
             return
+
+        raw = resp.get("content", "")
+        reasoning = resp.get("reasoning", "")
+
+        if reasoning:
+            print("\n" + "─" * 50)
+            print("🧠 REASONING")
+            print("─" * 50)
+            print(reasoning[:4000])
+            print("─" * 50 + "\n")
+            if raw.strip() == "":
+                continue
 
         if debug:
             print("---------- RAW -----------")

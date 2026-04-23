@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol
+import re
 
 import requests
 
@@ -128,7 +129,7 @@ class LlamaCppBackend:
         messages: List[Dict[str, str]],
         max_tokens: int,
         temperature: float,
-    ) -> Optional[str]:
+    ) -> Optional[Dict[str, str]]:
         base_payload: Dict[str, Any] = {
             "model": self.cfg.model,
             "messages": messages,
@@ -151,6 +152,7 @@ class LlamaCppBackend:
         rfs.append(None)
 
         last_err: Optional[str] = None
+
         for base in bases:
             for rf in rfs:
                 payload = dict(base)
@@ -163,9 +165,31 @@ class LlamaCppBackend:
                     if r.status_code != 200:
                         last_err = f"{r.status_code}: {r.text[:200]}"
                         continue
+
                     data = r.json()
-                    content = data["choices"][0]["message"].get("content", "")
-                    return content if isinstance(content, str) else ""
+                    msg = data["choices"][0]["message"]
+
+                    content = msg.get("content", "") or ""
+
+                    # Support both field names seen in llama.cpp ecosystem
+                    reasoning = (
+                        msg.get("reasoning")
+                        or msg.get("reasoning_content")
+                        or ""
+                    )
+
+                    # Fallback: extract <think>...</think> from content if present
+                    if not reasoning and isinstance(content, str):
+                        m = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
+                        if m:
+                            reasoning = m.group(1).strip()
+                            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+                    return {
+                        "content": content if isinstance(content, str) else "",
+                        "reasoning": reasoning if isinstance(reasoning, str) else "",
+                    }
+
                 except Exception as e:
                     last_err = str(e)
 
