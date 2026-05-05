@@ -251,12 +251,18 @@ def run_agent_turn(
     tool_gate_open = not need_tool
 
     for _round in range(MAX_TOOL_ROUNDS):
-        resp = backend.chat_completion(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        
+        try:
+            resp = backend.chat_completion(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except KeyboardInterrupt:
+            print("\n" + "─" * 50)
+            print("CTRL-C break")
+            print("─" * 50)
+            break
+
         if resp is None:
             print("✗ No response from model.")
             return
