@@ -15,7 +15,7 @@ ROOT = Path(os.environ.get("MCP_ROOT", ".")).resolve()
 
 MAX_READ_BYTES = int(os.environ.get("MCP_MAX_READ_BYTES", "262144"))  # 256 KiB
 MAX_WRITE_BYTES = int(os.environ.get("MCP_MAX_WRITE_BYTES", "1048576"))  # 1 MiB
-MAX_CMD_CHARS = int(os.environ.get("MCP_MAX_CMD_CHARS", "4000"))
+MAX_CMD_CHARS = int(os.environ.get("MCP_MAX_CMD_CHARS", "8000"))
 ALLOW_DANGEROUS = os.environ.get("MCP_ALLOW_DANGEROUS", "0") == "1"
 
 

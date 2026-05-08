@@ -64,6 +64,7 @@ Tool policy:
 - If type == "tool", output ONLY the tool JSON (do not include a final answer in the same reply).
 - NEVER claim a tool error unless you received a TOOL_RESULT that shows an error.
 - Avoid dangerous commands unless user explicitly requests and confirms.
+- When you are writting code, save it as soon as possible. Better then read it again than take it in memory.
 - If the user asks found something in the internet use DuckDuckGo (`ddgr [QUERY] --np --json`). 
 - If the user asks to read the internet page use 'elinks --dump [URL]' or 'curl [URL]'
 
@@ -274,14 +275,14 @@ def run_agent_turn(
             print("\n" + "─" * 50)
             print("🧠 REASONING")
             print("─" * 50)
-            print(reasoning[:4000])
+            print(reasoning)
             print("─" * 50 + "\n")
             if raw.strip() == "":
                 continue
 
         if debug:
             print("---------- RAW -----------")
-            print(raw[:2000])
+            print(raw[:1024])
             print("--------------------------")
 
         if raw.strip() == "":
