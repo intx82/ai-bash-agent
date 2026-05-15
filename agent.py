@@ -85,6 +85,138 @@ MAX_TOOL_ROUNDS = 64
 MAX_CMD_CHARS = 8000
 
 
+HANDOFF_REQUEST = """
+Write, please, your goals and plan how would you achieve these goals.
+
+Describe:
+1. What are the goals;
+2. What is the plan to achieve these goals;
+3. What already has been changed/tried;
+4. Describe failed attempts.
+
+Requirements:
+- Be concrete.
+- Mention important file paths if relevant.
+- Keep it compact but useful for continuing work.
+- Respond as EXACTLY ONE JSON object of type="message".
+- Put the full handoff text into the "message" field.
+"""
+
+_TEXT_EXTENSIONS = {
+    ".py", ".c", ".cpp", ".h", ".hpp", ".txt", ".md", ".json",
+    ".yaml", ".yml", ".ini", ".cfg", ".sh", ".toml", ".xml"
+}
+
+
+def _extract_message_text(raw: Optional[str]) -> str:
+    if raw is None:
+        return ""
+
+    raw = raw.strip()
+    if not raw:
+        return ""
+
+    objs = parse_assistant_json_objects(raw)
+    if objs:
+        obj = objs[0]
+        if isinstance(obj, dict):
+            msg = obj.get("message")
+            if isinstance(msg, str) and msg.strip():
+                return msg.strip()
+
+    return raw
+
+
+def _request_handoff_summary(
+    backend: Any,
+    messages: List[Dict[str, str]],
+    max_tokens: int,
+) -> str:
+    req_messages = list(messages)
+    req_messages.append({"role": "user", "content": HANDOFF_REQUEST})
+
+    resp = backend.chat_completion(
+        messages=req_messages,
+        max_tokens=min(max_tokens, 2048),
+        temperature=0.2,
+    )
+    if resp:
+        raw = resp.get("content", "")
+        text = _extract_message_text(raw)
+        if text:
+            print("\n" + "─" * 50)
+            print("🗘 Handoff")
+            print("─" * 50)
+            print(text)
+            print("─" * 50)
+            return text
+
+    return "No handoff summary could be generated."
+
+
+def _build_project_status(
+    workdir: str,
+    max_files: int = 200,
+    max_file_bytes: int = 16000,
+    max_total_chars: int = 60000,
+) -> str:
+    root = Path(workdir).resolve()
+
+    files: List[Path] = []
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            files.append(p)
+            if len(files) >= max_files:
+                break
+
+    lines: List[str] = []
+    lines.append(f"Workspace root: {root}")
+    lines.append("")
+    lines.append("Files:")
+    for p in files:
+        rel = str(p.relative_to(root)).replace("\\", "/")
+        try:
+            size = p.stat().st_size
+        except Exception:
+            size = -1
+        lines.append(f"- {rel} ({size} bytes)")
+
+    total_chars = 0
+    content_blocks: List[str] = []
+
+    for p in files:
+        if p.suffix.lower() not in _TEXT_EXTENSIONS:
+            continue
+
+        try:
+            size = p.stat().st_size
+        except Exception:
+            continue
+
+        if size > max_file_bytes:
+            continue
+
+        rel = str(p.relative_to(root)).replace("\\", "/")
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        block = f"\n### FILE: {rel}\n{text}\n"
+        if total_chars + len(block) > max_total_chars:
+            break
+
+        content_blocks.append(block)
+        total_chars += len(block)
+
+    if content_blocks:
+        lines.append("")
+        lines.append("Selected file contents:")
+        lines.extend(content_blocks)
+
+    return "\n".join(lines)
+
+
 def user_requires_tool(user_input: str) -> bool:
     s = user_input.lower()
     keywords = ("compile", "build", "run", "execute", "test", "verify", "benchmark")
@@ -664,6 +796,36 @@ def main():
                         messages = json.load(fd)
                     print('Context loaded')
                     user_input = "Remind me, please, what has been done?"
+
+                if user_input.lower() == "handoff":
+                    print("Preparing handoff...\n")
+
+                    handoff_summary = _request_handoff_summary(
+                        backend=backend,
+                        messages=messages,
+                        max_tokens=args.max_tokens,
+                    )
+
+                    project_status = _build_project_status(workspace.name)
+
+                    # Reset ONLY the LLM context, keep workspace and MCP as-is
+                    messages = [messages[0]]
+
+                    handoff_payload = (
+                        "HANDOFF CONTEXT\n"
+                        "===============\n\n"
+                        "Summary from previous context:\n"
+                        f"{handoff_summary}\n\n"
+                        "Current project status:\n"
+                        f"{project_status}\n\n"
+                        "Continue from this state. "
+                        "The workspace and current project files were preserved during handoff."
+                    )
+
+                    messages.append({"role": "user", "content": handoff_payload})
+
+                    print("Handoff complete. Context was reset, workspace preserved.\n")
+                    continue
 
                 if user_input.lower() == "status":
                     print(
