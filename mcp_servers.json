@@ -1,0 +1,39 @@
+{
+  "servers": {
+    "local": {
+      "enabled": true,
+      "required": true,
+      "transport": "stdio",
+      "command": "${PYTHON}",
+      "args": [
+        "${AGENT_DIR}/mcp_server.py"
+      ],
+      "env": {
+        "MCP_ROOT": "${WORKSPACE}"
+      },
+      "timeout_s": 300,
+      "startup_timeout_s": 15
+    },
+    "freecad": {
+      "enabled": true,
+      "required": false,
+      "transport": "stdio",
+      "command": "uvx",
+      "args": [
+        "freecad-mcp",
+        "--only-text-feedback"
+      ],
+      "timeout_s": 180,
+      "startup_timeout_s": 60,
+      "read_only_tools": [
+        "list_documents",
+        "get_objects",
+        "get_object",
+        "get_view",
+        "get_rpc_status",
+        "get_parts_list",
+        "get_async_status"
+      ]
+    }
+  }
+}

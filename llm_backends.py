@@ -85,10 +85,10 @@ class ChatBackend(Protocol):
     def check_connection(self) -> bool: ...
     def chat_completion(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         max_tokens: int,
         temperature: float,
-    ) -> Optional[str]: ...
+    ) -> Optional[Dict[str, str]]: ...
 
 
 @dataclass
@@ -126,7 +126,7 @@ class LlamaCppBackend:
 
     def chat_completion(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         max_tokens: int,
         temperature: float,
     ) -> Optional[Dict[str, str]]:
@@ -226,10 +226,10 @@ class OpenAIChatGPTBackend:
 
     def chat_completion(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         max_tokens: int,
         temperature: float,
-    ) -> Optional[str]:
+    ) -> Optional[Dict[str, str]]:
         response_format_variants: List[Optional[Dict[str, Any]]] = []
         if self.cfg.prefer_json_schema:
             response_format_variants.append(AGENT_RESPONSE_FORMAT_JSON_SCHEMA)
@@ -255,7 +255,7 @@ class OpenAIChatGPTBackend:
                     if rf is not None:
                         kwargs["response_format"] = rf
                     completion = self.client.chat.completions.create(**kwargs)
-                    return completion.choices[0].message.content
+                    return {"content": completion.choices[0].message.content or "", "reasoning": ""}
                 except Exception as e:
                     last_err = str(e)
 

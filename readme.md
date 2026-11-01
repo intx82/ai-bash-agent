@@ -55,7 +55,7 @@ python agent.py
 |--------|-------------|
 | `--server` | Backend to use: `llama.cpp`, `chatgpt`, or `openai` (default: `llama.cpp`) |
 | `-u`, `--url` | URL for llama.cpp server (default: `http://192.168.3.11:8080/v1/chat/completions`) |
-| `-m`, `--model` | Model name/id (defaults: `qwen` for llama.cpp, `gpt-5.4` for OpenAI) |
+| `-m`, `--model` | Model name/id (defaults: `qwen` for llama.cpp, `gpt-6.`-terra` for OpenAI) |
 | `--api-key` | API key for llama.cpp-compatible servers |
 | `--max-tokens` | Maximum tokens for completion (default: 4096) |
 | `--temp` | Temperature for generation (default: 0.7) |
@@ -101,7 +101,7 @@ python agent.py --server llama.cpp --no-confirm
 
 1. Set `OPENAI_API_KEY` environment variable
 2. Use `--server chatgpt` or `--server openai`
-3. Model defaults to `gpt-5.4` but can be customized
+3. Model defaults to `gpt-6.1-terra` but can be customized
 
 ## Technical Details
 
