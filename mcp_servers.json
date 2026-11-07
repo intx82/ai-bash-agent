@@ -34,6 +34,31 @@
         "get_parts_list",
         "get_async_status"
       ]
+    },
+    "openai_vision": {
+      "enabled": true,
+      "required": false,
+      "transport": "stdio",
+      "command": "${PYTHON}",
+      "args": [
+        "${AGENT_DIR}/mcp_openai_vision.py"
+      ],
+      "env": {
+        "MCP_VISION_ROOT": "${WORKSPACE}"
+      },
+      "timeout_s": 120,
+      "startup_timeout_s": 15,
+      "read_only_tools": [
+        "image_info",
+        "compare_regions"
+      ]
     }
+  },
+  "automatic_vision": {
+    "enabled": true,
+    "detail": "high",
+    "max_objects": 8,
+    "max_calls_per_turn": 4,
+    "max_image_bytes": 8388608
   }
 }

@@ -133,8 +133,8 @@ class LlamaCppBackend:
         base_payload: Dict[str, Any] = {
             "model": self.cfg.model,
             "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
+            #"max_tokens": max_tokens,
+            #"temperature": temperature,
             "stream": False,
         }
 
