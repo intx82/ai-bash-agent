@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 DEFAULT_SERVER_URL = "http://192.168.3.11:8080/v1/chat/completions"
 DEFAULT_MODEL_LLAMA = "qwen"
 DEFAULT_MODEL_OPENAI = "gpt-5.6-terra"
-AGENT_VERSION = "R261101_DEVICE_CASE_SKILL_23"
+AGENT_VERSION = "R261101_OPENAI_VISION_MCP_19"
 
 
 SYSTEM_PROMPT = r"""
@@ -57,8 +57,6 @@ Tool policy:
 - FreeCAD: after create_object/edit_object the agent automatically reads back get_object and, when available, performs a fixed read-only shape validation probe. Read TOOL_RESULT.verification; do NOT claim exact dimensions, volume, or shape validity unless status=verified. On status=mismatch or failed, report the error rather than success. On unverified, explicitly say that verification was incomplete.
 - OpenAI vision MCP: when automatic_vision.enabled=true in mcp_servers.json, a screenshot returned by a FreeCAD MCP tool (including freecad.get_view) is AUTOMATICALLY sent to openai_vision.describe_image after user approval. Read TOOL_RESULT.vision: status=analyzed_by_openai_mcp includes the visual description, approximate pixel boxes, and relative sizes. Do NOT call openai_vision.describe_image again for the same screenshot unless the user requests additional analysis. If auto vision is disabled, explicitly call openai_vision.describe_image for requested visual inspection (requires approval).
 - FreeCAD screenshots: a saved file path by itself is NOT vision. Only claim visual inspection when TOOL_RESULT.vision.status=analyzed_by_openai_mcp or analyzed_by_sidecar, or after successfully interpreting image pixels with a vision-capable main model. denied, failed, unavailable, skipped, not_analyzed and sent_to_main_model do NOT prove successful visual inspection. Never repeat freecad.get_view merely to circumvent a declined OpenAI upload. Estimated pixel object boxes are not CAD dimensions; use the geometry verifier for physical measurements.
-- FreeCAD occlusion rule: a lid, cover or body may hide internal geometry in a full-scene screenshot. OpenAI Vision cannot confirm objects that are not visible. If the LIVE catalog advertises freecad_scene.inspect_part, use freecad_scene.list_parts to identify internal names, then call freecad_scene.inspect_part with a SPECIFIC question about the desired part. It isolates the part for a focused screenshot, asks OpenAI Vision, and restores prior visibility. Check result.vision and result.visibility_restored; never claim the hidden feature was verified based only on a broad screenshot. Use freecad_scene.hide_parts/show_parts for persistent manual view changes. No GTK preview is required.
-- Only call freecad_scene.inspect_part if advertised in the live catalog; the tool requires confirmation because it temporarily changes FreeCAD GUI visibility and uploads pixels to a paid API.
 - OpenAI vision MCP image_info gives exact image dimensions without API usage. The old AGENT_VISION_MODE=sidecar is not needed for automatic MCP vision: leave AGENT_VISION_MODE=off.
 
 - An external tool may execute arbitrary code or modify files; explicit user confirmation is required unless the administrator explicitly lists it as read_only_tools in mcp_servers.json.
@@ -546,8 +544,7 @@ def _bash_looks_like_filesystem(cmd: str) -> bool:
         return True
 
     file_commands = {
-        #"cat", "ls", "find", "grep", "egrep", "fgrep", 
-        "sed", "awk", "perl",
+        "cat", "ls", "find", "grep", "egrep", "fgrep", "sed", "awk", "perl",
         "patch", "cp", "mv", "rm", "touch", "mkdir", "rmdir", "ln", "tee",
         "truncate", "dd", "head", "tail", "stat", "install", "rsync",
     }
@@ -808,38 +805,6 @@ def _sync_mcp_system_prompt(messages: List[Dict[str, str]], mcp: Any) -> None:
     base = current.split(_MCP_CATALOG_MARKER, 1)[0]
     catalog = mcp.prompt_catalog()
     updated = base + _MCP_CATALOG_MARKER + catalog
-
-    # Add a short, verified FreeCAD API guide only while FreeCAD is actually
-    # available. Keep the long guide on disk so it is not resent every turn.
-    if hasattr(mcp, "has_tool") and mcp.has_tool("freecad.execute_code"):
-        guide_path = Path(__file__).resolve().with_name("FREECAD_API_GUIDE.md")
-        try:
-            guide_text = guide_path.read_text(encoding="utf-8")
-        except OSError:
-            guide_text = ""
-        if guide_text:
-            quick = guide_text.split("<!-- END PROMPT QUICK REFERENCE -->", 1)[0]
-            updated += ("\n\n=== FREECAD PYTHON API REFERENCE ===\n"
-                        + quick[:6500]
-                        + "\nFull reference (read via local.read_text when needed): "
-                        + str(guide_path))
-        # Script-driven enclosure skill, only when FreeCAD is available.
-        # The full skill and generator stay on disk; the LLM sees only a short
-        # usage guide and can read the full file via the local MCP read_text.
-        skill_path = Path(__file__).resolve().with_name("device_case_skill.md")
-        generator_path = Path(__file__).resolve().with_name("device_case_generator.py")
-        if skill_path.is_file() and generator_path.is_file():
-            try:
-                skill_text = skill_path.read_text(encoding="utf-8")
-            except OSError:
-                skill_text = ""
-            if skill_text:
-                quick = skill_text.split("<!-- END PROMPT QUICK REFERENCE -->", 1)[0]
-                quick = quick.split("## QUICK REFERENCE", 1)[-1]
-                updated += ("\n\n=== PARAMETRIC DEVICE CASE SKILL ===\n"
-                            + quick[:3000]
-                            + "\nFull instructions: " + str(skill_path)
-                            + "\nTrusted generator: " + str(generator_path))
     if current != updated:
         messages[0]["content"] = updated
 
@@ -1226,15 +1191,8 @@ def run_agent_turn(
                         f"name: {name}\narguments: {json.dumps(arguments, ensure_ascii=False, indent=2)}",
                     )
 
-                    confirm_prompt = (
-                        "Temporarily isolate FreeCAD part and send its screenshot to OpenAI Vision (paid API)? (y/N): "
-                        if name == "freecad_scene.inspect_part"
-                        else "Change FreeCAD object visibility? (y/N): "
-                        if name in ("freecad_scene.set_visibility", "freecad_scene.hide_parts", "freecad_scene.show_parts")
-                        else "Execute this MCP tool? (y/N): "
-                    )
                     if needs_confirm and not _confirm(
-                        confirm_prompt, no_confirm, confirm_func
+                        "Execute this MCP tool? (y/N): ", no_confirm, confirm_func
                     ):
                         print("MCP tool cancelled.\n")
                         denied_payload = {"ok": False, "denied": True}
@@ -1273,27 +1231,6 @@ def run_agent_turn(
                             "name": name,
                             "result": res,
                         }
-                        if tool_failed and name == "freecad.execute_code":
-                            # Help the text-only model recover API errors rather
-                            # than repeating a failed, potentially partial edit.
-                            error_text = json.dumps(res, ensure_ascii=False)[:8192]
-                            if "isInstanceOf" in error_text and "AttributeError" in error_text:
-                                result_payload["freecad_api_hint"] = (
-                                    "Part.Edge has no isInstanceOf() method. "
-                                    "For topology use edge.ShapeType == 'Edge'; "
-                                    "for curve geometry inspect type(edge.Curve).__name__. "
-                                    "Document objects have a different API (TypeId/isDerivedFrom). "
-                                    "Do not repeat the same failing call. Inspect the live FreeCAD "
-                                    "object and check for partial modifications before retrying."
-                                )
-                            elif "AttributeError" in error_text or "TypeError" in error_text:
-                                result_payload["freecad_api_hint"] = (
-                                    "Check the actual FreeCAD API using a short read-only "
-                                    "execute_code probe with include_screenshot=false: "
-                                    "type(obj).__name__, dir(obj), getattr(obj, 'ShapeType', None). "
-                                    "Do not repeat the same code or assume the edit was rolled back. "
-                                    "See FREECAD_API_GUIDE.md next to agent.py."
-                                )
                         if not tool_failed and name in ("freecad.create_object", "freecad.edit_object"):
                             from freecad_verify import verify_mutation
                             verification = verify_mutation(mcp, name, arguments, res)
@@ -1540,7 +1477,7 @@ def main():
     p.add_argument("--version", action="version", version=f"%(prog)s {AGENT_VERSION}")
     p.add_argument(
         "--server",
-        choices=["llama.cpp", "chatgpt", "openai"],
+        choices=["llama.cpp", "chatgpt", "openai", "openai-compatible"],
         default="llama.cpp",
         help="Which backend to use: llama.cpp or chatgpt(openai).",
     )
@@ -1548,7 +1485,7 @@ def main():
         "-u",
         "--url",
         default=DEFAULT_SERVER_URL,
-        help="llama.cpp server URL (ignored for chatgpt).",
+        help="Chat-completions URL for llama.cpp or OpenAI-compatible endpoints.",
     )
     p.add_argument(
         "-m",
@@ -1559,7 +1496,7 @@ def main():
     p.add_argument(
         "--api-key",
         default=None,
-        help="Optional API key for llama.cpp-compatible servers (ignored for chatgpt; uses OPENAI_API_KEY).",
+        help="Optional API key for any configured backend.",
     )
     p.add_argument("--max-tokens", type=int, default=8192)
     p.add_argument("--temp", type=float, default=0.9)

@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol
 import re
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -133,8 +134,8 @@ class LlamaCppBackend:
         base_payload: Dict[str, Any] = {
             "model": self.cfg.model,
             "messages": messages,
-            #"max_tokens": max_tokens,
-            #"temperature": temperature,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
             "stream": False,
         }
 
@@ -197,6 +198,90 @@ class LlamaCppBackend:
         return None
 
 
+class OpenAICompatibleBackend:
+    """Generic /v1/chat/completions backend without llama.cpp-only fields.
+
+    Supports API-key-authenticated OpenAI and other compatible providers.
+    The API key is held in memory and is never written into chat files.
+    """
+    def __init__(self, cfg: BackendConfig):
+        self.cfg = cfg
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+        if cfg.api_key:
+            self.session.headers["Authorization"] = f"Bearer {cfg.api_key}"
+
+    def check_connection(self) -> bool:
+        try:
+            parsed = urlsplit(self.cfg.url)
+            if parsed.scheme not in ("https", "http") or not parsed.hostname:
+                print("Invalid OpenAI-compatible chat URL")
+                return False
+            if not parsed.path.endswith("/chat/completions"):
+                print("URL must end with /chat/completions")
+                return False
+            models_path = parsed.path[:-len("/chat/completions")] + "/models"
+            models_url = urlunsplit((parsed.scheme, parsed.netloc, models_path, "", ""))
+            response = self.session.get(models_url, timeout=(5, 10))
+            if response.ok:
+                return True
+            print(f"Connection test failed: HTTP {response.status_code}: {response.text[:180]}")
+            return False
+        except requests.RequestException as exc:
+            print(f"Connection test failed: {type(exc).__name__}: {exc}")
+            return False
+
+    def chat_completion(self, messages: List[Dict[str, Any]], max_tokens: int,
+                        temperature: float) -> Optional[Dict[str, str]]:
+        base: Dict[str, Any] = {
+            "model": self.cfg.model,
+            "messages": messages,
+            "stream": False,
+        }
+        # Reasoning models may reject temperature or max_tokens. Avoid sending
+        # llama.cpp-only fields (id_slot/cache_prompt) to remote APIs.
+        output_limits = ({"max_completion_tokens": max_tokens},
+                         {"max_tokens": max_tokens})
+        # The historical AGENT_RESPONSE_SCHEMA uses root oneOf, rejected by
+        # OpenAI's strict Structured Outputs schema validation. Prefer JSON
+        # object mode for remote servers rather than paying for a guaranteed
+        # HTTP 400 on every request.
+        formats: List[Optional[Dict[str, Any]]] = [
+            AGENT_RESPONSE_FORMAT_JSON_OBJECT, None,
+        ]
+        last_error = "unknown error"
+        for rf in formats:
+            for limit in output_limits:
+                payload = dict(base, **limit)
+                if rf is not None:
+                    payload["response_format"] = rf
+                try:
+                    response = self.session.post(
+                        self.cfg.url, json=payload,
+                        timeout=(8, self.cfg.request_timeout_s),
+                    )
+                    if not response.ok:
+                        last_error = f"HTTP {response.status_code}: {response.text[:180]}"
+                        # Never retry 401/403 with different payloads.
+                        if response.status_code in (401, 403):
+                            print(f"Remote model request failed: {last_error}")
+                            return None
+                        continue
+                    message = response.json()["choices"][0]["message"]
+                    content = message.get("content", "") or ""
+                    if not isinstance(content, str):
+                        content = ""
+                    reasoning = (message.get("reasoning_content")
+                                 or message.get("reasoning") or "")
+                    return {"content": content, "reasoning":
+                            reasoning if isinstance(reasoning, str) else ""}
+                except (requests.RequestException, ValueError, KeyError, IndexError,
+                        TypeError) as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+        print(f"Remote model request failed: {last_error}")
+        return None
+
+
 class OpenAIChatGPTBackend:
     def __init__(self, cfg: BackendConfig):
         self.cfg = cfg
@@ -205,11 +290,16 @@ class OpenAIChatGPTBackend:
         except Exception as e:
             raise RuntimeError("OpenAI backend selected, but python module 'openai' is not installed.") from e
 
-        api_key = os.environ.get("OPENAI_API_KEY")
+        api_key = cfg.api_key or os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY env var is not set.")
 
         base_url = os.environ.get("OPENAI_BASE_URL")
+        if not base_url and cfg.url:
+            parts = urlsplit(cfg.url)
+            if parts.path.endswith("/chat/completions") and parts.hostname == "api.openai.com":
+                base_url = urlunsplit((parts.scheme, parts.netloc,
+                                      parts.path[:-len("/chat/completions")], "", ""))
         self.client = (
             OpenAI(api_key=api_key, base_url=base_url)
             if base_url
@@ -265,7 +355,12 @@ class OpenAIChatGPTBackend:
 
 def make_backend(cfg: BackendConfig) -> ChatBackend:
     if cfg.server == "llama.cpp":
+        # User-provided OpenAI endpoints must not receive id_slot/cache_prompt.
+        if urlsplit(cfg.url).hostname == "api.openai.com":
+            return OpenAICompatibleBackend(cfg)
         return LlamaCppBackend(cfg)
+    if cfg.server == "openai-compatible":
+        return OpenAICompatibleBackend(cfg)
     if cfg.server in ("chatgpt", "openai"):
         return OpenAIChatGPTBackend(cfg)
     raise ValueError(f"Unknown server: {cfg.server}")

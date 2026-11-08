@@ -16,8 +16,9 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
+from agent_gui_support import ChatUIV24Mixin
 
-GTKUI_VERSION = "R260820_GUI_ONLY_12"
+GTKUI_VERSION = "R261107_GUI_FILE_CHATS_24_1"
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +349,7 @@ def run_agent_gui(args: Optional[Any] = None, core: Optional[Any] = None) -> Non
         def do_get_preferred_height_for_width(self, _width: int) -> Tuple[int, int]:
             return self.fixed_height, self.fixed_height
 
-    class AgentGuiWindow(Gtk.Window):
+    class AgentGuiWindow(ChatUIV24Mixin, Gtk.Window):
         def _pick_initial_window_size(self) -> Tuple[int, int]:
             try:
                 display = Gdk.Display.get_default()
@@ -537,7 +538,9 @@ def run_agent_gui(args: Optional[Any] = None, core: Optional[Any] = None) -> Non
             outer.pack_start(self.scroll, True, True, 0)
             outer.pack_start(input_hint, False, False, 0)
             outer.pack_start(bottom, False, False, 0)
-            self.add(outer)
+            self._gtk, self._glib, self._pango = Gtk, GLib, Pango
+            self._start_mcp_v24 = _start_mcp_for_workspace
+            self._install_chat_layout(outer, top_bar)
 
             self.append_markdown(
                 f"# AI Agent\n\n"
@@ -564,44 +567,14 @@ def run_agent_gui(args: Optional[Any] = None, core: Optional[Any] = None) -> Non
             self.start_runtime()
 
         def start_runtime(self) -> None:
-            try:
-                from llm_backends import BackendConfig, make_backend
-
-                cfg = BackendConfig(
-                    server=self.args.server,
-                    model=self.model,
-                    url=self.args.url,
-                    api_key=self.args.api_key,
-                    prefer_json_schema=(not self.args.no_json_schema),
-                )
-                self.backend = make_backend(cfg)
-
-                with contextlib.redirect_stdout(io.StringIO()) as stdout_buf, contextlib.redirect_stderr(io.StringIO()) as stderr_buf:
-                    ok = self.backend.check_connection()
-
-                captured = (stdout_buf.getvalue() + stderr_buf.getvalue()).strip()
-                if captured:
-                    self.append_markdown("## Backend check\n\n" + _markdown_fence(captured))
-
-                if not ok:
-                    self.set_busy(True)
-                    self.append_markdown("## Backend connection failed\n\nCheck server/model settings and restart the GUI.")
-                    return
-
-                self.workspace = tempfile.TemporaryDirectory(prefix="ai-bash-agent-")
-                self.mcp = _start_mcp_for_workspace(self.workspace.name)
-                self.append_markdown(
-                    f"## Ready\n\nWorkspace: `{self.workspace.name}`\n"
-                )
-            except Exception as exc:
-                self.set_busy(True)
-                self.append_markdown("## Startup error\n\n" + _markdown_fence(str(exc)))
+            self._start_runtime_v24()
 
         def on_destroy(self, *_args: Any) -> None:
             self.cleanup()
             Gtk.main_quit()
 
         def cleanup(self) -> None:
+            self._save_current_chat_v24(silent=True)
             try:
                 if self.mcp is not None:
                     self.mcp.close()
@@ -638,6 +611,7 @@ def run_agent_gui(args: Optional[Any] = None, core: Optional[Any] = None) -> Non
             self.clear_button.set_sensitive(not busy)
             self.status_button.set_sensitive(not busy)
             self.handoff_button.set_sensitive((not busy) and can_run)
+            self._sync_v24_controls()
 
         def append_markdown(self, markdown_text: str) -> None:
             if not markdown_text:
@@ -745,6 +719,8 @@ def run_agent_gui(args: Optional[Any] = None, core: Optional[Any] = None) -> Non
             self.on_send_clicked(None)
 
         def on_send_clicked(self, _button: Any) -> None:
+            if self.connection_pending:
+                return
             if self.busy:
                 self.request_stop_current_turn()
                 return
@@ -807,6 +783,7 @@ def run_agent_gui(args: Optional[Any] = None, core: Optional[Any] = None) -> Non
             self.stop_requested = False
             self.cancel_event = threading.Event()
             self.set_busy(False)
+            GLib.idle_add(self._save_chat_after_turn_v24)
 
         def worker_handle_input(self, user_input: str, auto_confirm: bool) -> None:
             self.worker_ident = threading.get_ident()
@@ -852,10 +829,14 @@ def run_agent_gui(args: Optional[Any] = None, core: Optional[Any] = None) -> Non
                 except Exception:
                     pass
 
+                self._save_current_chat_v24(silent=True)
+                self.current_chat_path = None
                 self.messages = [self.messages[0]]
                 self.workspace = tempfile.TemporaryDirectory(prefix="ai-bash-agent-")
                 self.mcp = _start_mcp_for_workspace(self.workspace.name)
-                GLib.idle_add(lambda: (self.reset_transcript(), False)[1])
+                GLib.idle_add(lambda: (self.reset_transcript(),
+                    self.chat_title_label.set_text("New chat"),
+                    self._refresh_chats_v24(), False)[-1])
                 return (
                     "## Context cleared\n\n"
                     f"Old workspace: `{old}`  \n"
@@ -863,14 +844,11 @@ def run_agent_gui(args: Optional[Any] = None, core: Optional[Any] = None) -> Non
                 )
 
             if cmd == "save":
-                with open("ctx.json", "wt", encoding="utf-8") as fd:
-                    json.dump(self.messages, fd)
-                return "## Context saved\n\nSaved to `ctx.json`."
+                GLib.idle_add(self._save_command_v24)
+                return "## Chat save requested\n\nSaved chats appear in the sidebar."
 
             if cmd == "load":
-                with open("ctx.json", "rt", encoding="utf-8") as fd:
-                    self.messages = json.load(fd)
-                user_input = "Remind me, please, what has been done?"
+                return "## Load a chat\n\nChoose a saved chat from the left sidebar or click Load."
 
             if cmd == "handoff":
                 with contextlib.redirect_stdout(io.StringIO()) as stdout_buf, contextlib.redirect_stderr(io.StringIO()) as stderr_buf:
@@ -1395,81 +1373,11 @@ def run_agent_gui(args: Optional[Any] = None, core: Optional[Any] = None) -> Non
             return validated
 
         def load_context_dialog(self, _button: Any) -> None:
-            if self.busy:
-                return
-
-            dialog = Gtk.FileChooserDialog(
-                title="Load LLM context",
-                parent=self,
-                action=Gtk.FileChooserAction.OPEN,
-            )
-            dialog.add_buttons(
-                "_Cancel", Gtk.ResponseType.CANCEL,
-                "_Load", Gtk.ResponseType.ACCEPT,
-            )
-            self.add_context_file_filters(dialog)
-            dialog.set_current_name("ctx.json")
-
-            try:
-                if dialog.run() != Gtk.ResponseType.ACCEPT:
-                    return
-                filename = dialog.get_filename()
-                if not filename:
-                    return
-
-                path = Path(filename).expanduser().resolve()
-                data = json.loads(path.read_text(encoding="utf-8"))
-                self.messages = self.validate_context_messages(data)
-                self.append_markdown(
-                    "## Context loaded\n\n"
-                    f"Loaded `{len(self.messages)}` messages from `{path}`."
-                )
-            except Exception as exc:
-                self.append_markdown(
-                    "## Could not load context\n\n" + _markdown_fence(str(exc))
-                )
-            finally:
-                dialog.destroy()
+            self._load_context_dialog_v24(_button)
 
         def save_context_dialog(self, _button: Any) -> None:
-            dialog = Gtk.FileChooserDialog(
-                title="Save LLM context",
-                parent=self,
-                action=Gtk.FileChooserAction.SAVE,
-            )
-            dialog.add_buttons(
-                "_Cancel", Gtk.ResponseType.CANCEL,
-                "_Save", Gtk.ResponseType.ACCEPT,
-            )
-            dialog.set_do_overwrite_confirmation(True)
-            dialog.set_current_name("ctx.json")
-            self.add_context_file_filters(dialog)
+            self._save_context_dialog_v24(_button)
 
-            try:
-                if dialog.run() != Gtk.ResponseType.ACCEPT:
-                    return
-                filename = dialog.get_filename()
-                if not filename:
-                    return
-
-                path = Path(filename).expanduser().resolve()
-                messages_snapshot = [dict(message) for message in list(self.messages)]
-                path.write_text(
-                    json.dumps(messages_snapshot, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                self.append_markdown(
-                    "## Context saved\n\n"
-                    f"Saved `{len(messages_snapshot)}` messages to `{path}`."
-                )
-            except Exception as exc:
-                self.append_markdown(
-                    "## Could not save context\n\n" + _markdown_fence(str(exc))
-                )
-            finally:
-                dialog.destroy()
-
-        # Backward-compatible alias for older code that called open_markdown().
         def open_markdown(self, _button: Any) -> None:
             self.open_agent_md(_button)
 
