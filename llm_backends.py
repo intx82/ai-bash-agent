@@ -233,51 +233,43 @@ class OpenAICompatibleBackend:
 
     def chat_completion(self, messages: List[Dict[str, Any]], max_tokens: int,
                         temperature: float) -> Optional[Dict[str, str]]:
+        # Keep the agent's method signature, but do NOT forward llama.cpp-style
+        # sampling, slot or output-limit parameters to OpenAI endpoints. Some
+        # reasoning models reject them; use the provider's defaults instead.
         base: Dict[str, Any] = {
             "model": self.cfg.model,
             "messages": messages,
-            "stream": False,
         }
-        # Reasoning models may reject temperature or max_tokens. Avoid sending
-        # llama.cpp-only fields (id_slot/cache_prompt) to remote APIs.
-        output_limits = ({"max_completion_tokens": max_tokens},
-                         {"max_tokens": max_tokens})
-        # The historical AGENT_RESPONSE_SCHEMA uses root oneOf, rejected by
-        # OpenAI's strict Structured Outputs schema validation. Prefer JSON
-        # object mode for remote servers rather than paying for a guaranteed
-        # HTTP 400 on every request.
-        formats: List[Optional[Dict[str, Any]]] = [
-            AGENT_RESPONSE_FORMAT_JSON_OBJECT, None,
-        ]
+        payload = dict(base, response_format=AGENT_RESPONSE_FORMAT_JSON_OBJECT)
         last_error = "unknown error"
-        for rf in formats:
-            for limit in output_limits:
-                payload = dict(base, **limit)
-                if rf is not None:
-                    payload["response_format"] = rf
-                try:
-                    response = self.session.post(
-                        self.cfg.url, json=payload,
-                        timeout=(8, self.cfg.request_timeout_s),
-                    )
-                    if not response.ok:
-                        last_error = f"HTTP {response.status_code}: {response.text[:180]}"
-                        # Never retry 401/403 with different payloads.
-                        if response.status_code in (401, 403):
-                            print(f"Remote model request failed: {last_error}")
-                            return None
+        for attempt in range(2):
+            try:
+                response = self.session.post(
+                    self.cfg.url, json=payload,
+                    timeout=(8, self.cfg.request_timeout_s),
+                )
+                if not response.ok:
+                    last_error = f"HTTP {response.status_code}: {response.text[:220]}"
+                    # Retry without response_format ONLY if the provider rejects
+                    # that field. Do not duplicate paid requests for other errors.
+                    if (attempt == 0 and response.status_code == 400 and
+                            "response_format" in response.text.lower()):
+                        payload = base
                         continue
-                    message = response.json()["choices"][0]["message"]
-                    content = message.get("content", "") or ""
-                    if not isinstance(content, str):
-                        content = ""
-                    reasoning = (message.get("reasoning_content")
-                                 or message.get("reasoning") or "")
-                    return {"content": content, "reasoning":
-                            reasoning if isinstance(reasoning, str) else ""}
-                except (requests.RequestException, ValueError, KeyError, IndexError,
-                        TypeError) as exc:
-                    last_error = f"{type(exc).__name__}: {exc}"
+                    print(f"Remote model request failed: {last_error}")
+                    return None
+                message = response.json()["choices"][0]["message"]
+                content = message.get("content", "") or ""
+                if not isinstance(content, str):
+                    content = ""
+                reasoning = (message.get("reasoning_content")
+                             or message.get("reasoning") or "")
+                return {"content": content, "reasoning":
+                        reasoning if isinstance(reasoning, str) else ""}
+            except (requests.RequestException, ValueError, KeyError, IndexError,
+                    TypeError) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                break
         print(f"Remote model request failed: {last_error}")
         return None
 

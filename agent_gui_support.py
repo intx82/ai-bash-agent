@@ -17,11 +17,28 @@ from urllib.parse import urlsplit
 
 from agent_chat_store import CHAT_FORMAT, ChatStore, format_timestamp
 
+OPENAI_CHAT_URL_V25 = "https://api.openai.com/v1/chat/completions"
+DEFAULT_OPENAI_MODEL_V25 = "gpt-6.1-sol"
+
+
+def _is_openai_mode_v25(server: str, endpoint: str) -> bool:
+    """Identify OpenAI mode without confusing other compatible providers."""
+    if server in ("openai", "chatgpt"):
+        return True
+    return server == "openai-compatible" and endpoint.rstrip("/") == OPENAI_CHAT_URL_V25
+
 
 class ChatUIV24Mixin:
     def _install_chat_layout(self, outer: Any, top_bar: Any) -> None:
         Gtk = self._gtk
         self.connection_pending = False
+        if _is_openai_mode_v25(self.args.server, self.args.url):
+            self._last_openai_key_v25 = self.args.api_key
+            self._last_openai_model_v25 = self.model
+        else:
+            self._last_local_key_v25 = self.args.api_key
+            self._last_local_url_v25 = self.args.url
+            self._last_local_model_v25 = self.model
         self.current_chat_path: Optional[Path] = None
         self.current_chat_signature = None
         self._saved_chat_fingerprint = None
@@ -392,6 +409,10 @@ class ChatUIV24Mixin:
         if self.workspace is None:
             self.workspace = tempfile.TemporaryDirectory(prefix="ai-bash-agent-")
         self._system_prompt_v24 = self.messages[0]["content"]
+        if _is_openai_mode_v25(self.args.server, self.args.url):
+            self.args.server = "openai-compatible"
+            self.args.url = OPENAI_CHAT_URL_V25
+            self.args.api_key = self.args.api_key or os.environ.get("OPENAI_API_KEY")
         self._connect_async_v24(self.args.server, self.args.url,
                                 self.model, self.args.api_key, initial=True)
 
@@ -412,58 +433,126 @@ class ChatUIV24Mixin:
         if self.busy or self.connection_pending:
             return
         Gtk = self._gtk
-        dialog = Gtk.Dialog(title="Connect to LLM", transient_for=self, flags=Gtk.DialogFlags.MODAL)
+        dialog = Gtk.Dialog(title="Connect to LLM", transient_for=self,
+                            flags=Gtk.DialogFlags.MODAL)
         dialog.add_buttons("_Cancel", Gtk.ResponseType.CANCEL,
                            "Connect", Gtk.ResponseType.ACCEPT)
         dialog.set_default_response(Gtk.ResponseType.ACCEPT)
         grid = Gtk.Grid(row_spacing=9, column_spacing=9)
         grid.set_border_width(13)
         dialog.get_content_area().add(grid)
-        server_choices = (
-            ("llama.cpp", "llama.cpp"),
-            ("openai-compatible", "OpenAI-compatible / remote API"),
-            ("openai", "OpenAI SDK"),
-        )
-        chooser = Gtk.ComboBoxText()
-        for value, label in server_choices:
-            chooser.append(value, label)
-        chooser.set_active_id(self.args.server if self.args.server != "chatgpt" else "openai")
-        if chooser.get_active_id() is None:
-            chooser.set_active_id("openai-compatible")
-        grid.attach(Gtk.Label(label="Backend", xalign=0), 0, 0, 1, 1)
-        grid.attach(chooser, 1, 0, 1, 1)
+
+        openai_mode = _is_openai_mode_v25(self.args.server, self.args.url)
+        local_url = getattr(self, "_last_local_url_v25", None)
+        local_model = getattr(self, "_last_local_model_v25", None)
+        openai_model = getattr(self, "_last_openai_model_v25", None)
+        if not local_url:
+            local_url = (os.environ.get("AGENT_LOCAL_URL", "http://127.0.0.1:8080/v1/chat/completions")
+                         if openai_mode else self.args.url)
+        if not local_model:
+            local_model = (os.environ.get("AGENT_MODEL", "qwen")
+                           if openai_mode else self.model)
+        if not openai_model:
+            openai_model = self.model if openai_mode else DEFAULT_OPENAI_MODEL_V25
+
+        use_openai = Gtk.CheckButton(label="OpenAI")
+        use_openai.set_active(openai_mode)
+        use_openai.set_tooltip_text(
+            "Use OpenAICompatibleBackend and the fixed api.openai.com endpoint")
+        grid.attach(use_openai, 1, 0, 1, 1)
+
+        family = Gtk.ComboBoxText()
+        family.append("qwen", "Qwen")
+        family.append("other", "Other")
+        family.set_active_id("qwen" if local_model.lower().startswith("qwen") else "other")
+        grid.attach(Gtk.Label(label="Model family", xalign=0), 0, 1, 1, 1)
+        grid.attach(family, 1, 1, 1, 1)
+
         url = Gtk.Entry()
         url.set_width_chars(52)
-        url.set_text(self.args.url or "")
-        grid.attach(Gtk.Label(label="URL", xalign=0), 0, 1, 1, 1)
-        grid.attach(url, 1, 1, 1, 1)
+        url.set_text(OPENAI_CHAT_URL_V25 if openai_mode else local_url)
+        grid.attach(Gtk.Label(label="URL", xalign=0), 0, 2, 1, 1)
+        grid.attach(url, 1, 2, 1, 1)
+
         model = Gtk.Entry()
-        model.set_text(self.model)
-        grid.attach(Gtk.Label(label="Model", xalign=0), 0, 2, 1, 1)
-        grid.attach(model, 1, 2, 1, 1)
+        model.set_text(openai_model if openai_mode else local_model)
+        model.set_placeholder_text("Model identifier")
+        grid.attach(Gtk.Label(label="Model", xalign=0), 0, 3, 1, 1)
+        grid.attach(model, 1, 3, 1, 1)
+
         key = Gtk.Entry()
         key.set_visibility(False)
-        key.set_placeholder_text("Leave blank to keep current key (if any)")
-        grid.attach(Gtk.Label(label="API key", xalign=0), 0, 3, 1, 1)
-        grid.attach(key, 1, 3, 1, 1)
-        note = Gtk.Label(label="The API key stays in memory; chats never contain it.")
+        key.set_placeholder_text("Current provider key, or OPENAI_API_KEY for OpenAI")
+        grid.attach(Gtk.Label(label="API key", xalign=0), 0, 4, 1, 1)
+        grid.attach(key, 1, 4, 1, 1)
+
+        note = Gtk.Label(label="Keys stay in memory, never in saved chats. OpenAI URL is locked.")
         note.set_xalign(0)
-        grid.attach(note, 1, 4, 1, 1)
+        grid.attach(note, 1, 5, 1, 1)
+
+        state = {"mode": openai_mode, "local_url": local_url,
+                 "local_model": local_model, "openai_model": openai_model}
+
+        def on_openai_toggled(button: Any) -> None:
+            now_openai = bool(button.get_active())
+            if now_openai == state["mode"]:
+                return
+            if now_openai:
+                state["local_url"] = url.get_text()
+                state["local_model"] = model.get_text()
+                url.set_text(OPENAI_CHAT_URL_V25)
+                model.set_text(state["openai_model"])
+            else:
+                state["openai_model"] = model.get_text()
+                url.set_text(state["local_url"])
+                model.set_text(state["local_model"])
+                family.set_active_id(
+                    "qwen" if state["local_model"].lower().startswith("qwen") else "other")
+            url.set_editable(not now_openai)
+            url.set_sensitive(not now_openai)
+            family.set_sensitive(not now_openai)
+            state["mode"] = now_openai
+
+        def on_family_changed(combo: Any) -> None:
+            if use_openai.get_active():
+                return
+            if combo.get_active_id() == "qwen":
+                if not model.get_text().strip().lower().startswith("qwen"):
+                    model.set_text("qwen")
+            elif combo.get_active_id() == "other":
+                if model.get_text().strip().lower() == "qwen":
+                    model.set_text("")
+
+        use_openai.connect("toggled", on_openai_toggled)
+        family.connect("changed", on_family_changed)
+        url.set_editable(not openai_mode)
+        url.set_sensitive(not openai_mode)
+        family.set_sensitive(not openai_mode)
         dialog.show_all()
         try:
             if dialog.run() != Gtk.ResponseType.ACCEPT:
                 return
-            selected = chooser.get_active_id() or "openai-compatible"
-            endpoint = url.get_text().strip()
+            selected = "openai-compatible" if use_openai.get_active() else "llama.cpp"
+            endpoint = (OPENAI_CHAT_URL_V25 if use_openai.get_active()
+                        else url.get_text().strip())
             model_name = model.get_text().strip()
             entered_key = key.get_text().strip()
-            api_key = entered_key or self.args.api_key
+            if use_openai.get_active():
+                api_key = (entered_key or getattr(self, "_last_openai_key_v25", None)
+                           or os.environ.get("OPENAI_API_KEY"))
+            else:
+                api_key = (entered_key or getattr(self, "_last_local_key_v25", None))
+
             parsed = urlsplit(endpoint)
             if parsed.scheme not in ("http", "https") or not parsed.hostname:
                 self.append_markdown("## Connection error\n\nEnter a valid HTTP(S) URL.")
                 return
             if not model_name:
                 self.append_markdown("## Connection error\n\nModel is required.")
+                return
+            if use_openai.get_active() and not api_key:
+                self.append_markdown(
+                    "## Connection error\n\nProvide an OpenAI API key or set OPENAI_API_KEY.")
                 return
             if api_key and parsed.scheme != "https" and parsed.hostname not in (
                     "127.0.0.1", "localhost", "::1"):
@@ -481,7 +570,6 @@ class ChatUIV24Mixin:
                     warning.destroy()
             self._connect_async_v24(selected, endpoint, model_name, api_key)
         finally:
-            # GTK Entry keeps secret only in volatile widget memory.
             key.set_text("")
             dialog.destroy()
 
@@ -516,6 +604,15 @@ class ChatUIV24Mixin:
                     self.backend = candidate
                     if new_mcp is not None:
                         self.mcp = new_mcp
+                    # Keep independent in-memory credentials and connection profiles.
+                    # Never forward a local proxy's key to OpenAI or vice versa.
+                    if _is_openai_mode_v25(server, url):
+                        self._last_openai_model_v25 = model
+                        self._last_openai_key_v25 = api_key
+                    else:
+                        self._last_local_url_v25 = url
+                        self._last_local_model_v25 = model
+                        self._last_local_key_v25 = api_key
                     self.args.server = server
                     self.args.url = url
                     self.args.model = model
