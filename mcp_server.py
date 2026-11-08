@@ -14,9 +14,10 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
-mcp = FastMCP("local-tools", json_response=True)
+mcp = MCPServer("local-tools")
 
 MAX_READ_BYTES = int(os.environ.get("MCP_MAX_READ_BYTES", "262144"))  # 256 KiB
 MAX_WRITE_BYTES = int(os.environ.get("MCP_MAX_WRITE_BYTES", "1048576"))  # 1 MiB per text write/append
@@ -37,7 +38,7 @@ def _safe_relpath(path: str) -> Path:
     root = _root()
 
     if not isinstance(path, str) or not path:
-        raise ValueError("path must be a non-empty string")
+        raise ToolError("path must be a non-empty string")
 
     p = Path(path)
     # Preserve existing support for absolute paths; expand ~/... correctly.
@@ -45,7 +46,7 @@ def _safe_relpath(path: str) -> Path:
         return p.expanduser().resolve()
 
     if any(part == ".." for part in p.parts):
-        raise ValueError(".. is not allowed in path")
+        raise ToolError(".. is not allowed in path")
 
     full = (root / p).resolve()
     return full
@@ -74,15 +75,15 @@ def read_text(
     Ranged responses provide next_start_line for convenient paging.
     """
     if not isinstance(start_line, int) or isinstance(start_line, bool) or start_line < 1:
-        raise ValueError("start_line must be a positive 1-based integer")
+        raise ToolError("start_line must be a positive 1-based integer")
     if end_line is not None:
         if not isinstance(end_line, int) or isinstance(end_line, bool) or end_line < start_line:
-            raise ValueError("end_line must be an integer >= start_line (inclusive)")
+            raise ToolError("end_line must be an integer >= start_line (inclusive)")
     if count is not None:
         if not isinstance(count, int) or isinstance(count, bool) or count < 1:
-            raise ValueError("count must be a positive integer")
+            raise ToolError("count must be a positive integer")
     if end_line is not None and count is not None:
-        raise ValueError("specify end_line or count, not both")
+        raise ToolError("specify end_line or count, not both")
 
     full = _safe_relpath(path)
     ranged = start_line != 1 or end_line is not None or count is not None
@@ -90,7 +91,7 @@ def read_text(
         if not ranged:
             data = f.read(MAX_READ_BYTES + 1)
             if len(data) > MAX_READ_BYTES:
-                raise ValueError(
+                raise ToolError(
                     f"file exceeds MCP_MAX_READ_BYTES ({MAX_READ_BYTES} bytes); "
                     "use start_line with end_line or count to read a smaller range"
                 )
@@ -124,7 +125,7 @@ def read_text(
             if not line:
                 break
             if bytes_read + len(line) > MAX_READ_BYTES:
-                raise ValueError(
+                raise ToolError(
                     f"requested range exceeds MCP_MAX_READ_BYTES ({MAX_READ_BYTES} bytes); "
                     "request fewer lines or increase MCP_MAX_READ_BYTES"
                 )
@@ -155,7 +156,7 @@ def list_files(
     symlinks; results are bounded to avoid filling the LLM context window.
     """
     if not isinstance(max_entries, int) or isinstance(max_entries, bool) or not 1 <= max_entries <= 2000:
-        raise ValueError("max_entries must be between 1 and 2000")
+        raise ToolError("max_entries must be between 1 and 2000")
     full = _safe_relpath(path)
     if not full.exists() and not full.is_symlink():
         raise FileNotFoundError(str(full))
@@ -234,18 +235,18 @@ def _grep_files_impl(
     and binary files are skipped unless configured otherwise.
     """
     if not isinstance(pattern, str) or not pattern or len(pattern) > 512:
-        raise ValueError("pattern must be a non-empty string of at most 512 characters")
+        raise ToolError("pattern must be a non-empty string of at most 512 characters")
     if not isinstance(file_glob, str) or not file_glob:
-        raise ValueError("file_glob must be non-empty")
+        raise ToolError("file_glob must be non-empty")
     if not isinstance(max_matches, int) or isinstance(max_matches, bool) or not 1 <= max_matches <= 1000:
-        raise ValueError("max_matches must be between 1 and 1000")
+        raise ToolError("max_matches must be between 1 and 1000")
     if not isinstance(max_files, int) or isinstance(max_files, bool) or not 0 <= max_files <= 1000000:
-        raise ValueError("max_files must be between 0 (unlimited) and 1000000")
+        raise ToolError("max_files must be between 0 (unlimited) and 1000000")
     if not isinstance(include_hidden, bool):
-        raise ValueError("include_hidden must be a boolean")
+        raise ToolError("include_hidden must be a boolean")
     if (not isinstance(timeout_s, int) or isinstance(timeout_s, bool)
             or not 1 <= timeout_s <= 240):
-        raise ValueError("timeout_s must be between 1 and 240 seconds")
+        raise ToolError("timeout_s must be between 1 and 240 seconds")
 
     started = time.monotonic()
     deadline = started + timeout_s
@@ -254,7 +255,7 @@ def _grep_files_impl(
     if not full.exists():
         raise FileNotFoundError(str(full))
     if not (full.is_file() or full.is_dir()):
-        raise ValueError(f"path is not a regular file or directory: {full}")
+        raise ToolError(f"path is not a regular file or directory: {full}")
 
     compiled = re.compile(pattern, re.IGNORECASE) if regex else None
     needle = pattern.casefold() if ignore_case else pattern
@@ -446,7 +447,7 @@ async def grep_files(
     }
     if (not isinstance(timeout_s, int) or isinstance(timeout_s, bool)
             or not 1 <= timeout_s <= 240):
-        raise ValueError("timeout_s must be between 1 and 240 seconds")
+        raise ToolError("timeout_s must be between 1 and 240 seconds")
 
     # Reject immediately when the worker pool is saturated. Waiting for a grep
     # slot must not consume the 300s bridge timeout either.
@@ -507,10 +508,10 @@ def _grep_worker_main() -> None:
     try:
         raw = sys.stdin.buffer.read(32769)
         if len(raw) > 32768:
-            raise ValueError("grep request is too large")
+            raise ToolError("grep request is too large")
         args = json.loads(raw)
         if not isinstance(args, dict):
-            raise ValueError("grep request must be a JSON object")
+            raise ToolError("grep request must be a JSON object")
         result = _grep_files_impl(**args)
         sys.stdout.write(json.dumps(result, ensure_ascii=False))
     except Exception as exc:
@@ -522,10 +523,10 @@ def _grep_worker_main() -> None:
 def write_text(path: str, content: str, overwrite: bool = True) -> Dict[str, Any]:
     """Write a UTF-8 text file. Creates parent dirs. Size-limited."""
     if not isinstance(content, str):
-        raise ValueError("content must be a string")
+        raise ToolError("content must be a string")
     raw = content.encode("utf-8")
     if len(raw) > MAX_WRITE_BYTES:
-        raise ValueError(f"content too large ({len(raw)} bytes > {MAX_WRITE_BYTES})")
+        raise ToolError(f"content too large ({len(raw)} bytes > {MAX_WRITE_BYTES})")
 
     full = _safe_relpath(path)
     full.parent.mkdir(parents=True, exist_ok=True)
@@ -535,7 +536,7 @@ def write_text(path: str, content: str, overwrite: bool = True) -> Dict[str, Any
         with full.open("wb" if overwrite else "xb") as f:
             f.write(raw)
     except FileExistsError as e:
-        raise ValueError("file exists and overwrite=False") from e
+        raise ToolError("file exists and overwrite=False") from e
     return {"ok": True, "path": path, "bytes_written": len(raw)}
 
 @mcp.tool()
@@ -546,10 +547,10 @@ def append_text(path: str, content: str) -> Dict[str, Any]:
     No newline is added automatically.
     """
     if not isinstance(content, str):
-        raise ValueError("content must be a string")
+        raise ToolError("content must be a string")
     raw = content.encode("utf-8")
     if len(raw) > MAX_WRITE_BYTES:
-        raise ValueError(f"content too large ({len(raw)} bytes > {MAX_WRITE_BYTES})")
+        raise ToolError(f"content too large ({len(raw)} bytes > {MAX_WRITE_BYTES})")
 
     full = _safe_relpath(path)
     full.parent.mkdir(parents=True, exist_ok=True)
@@ -574,22 +575,22 @@ def merge_files(paths: list[str], output_path: str, overwrite: bool = True) -> D
     not be any of the inputs. A temporary file prevents corrupt partial output.
     """
     if not isinstance(paths, list) or len(paths) < 2:
-        raise ValueError("paths must be a list containing at least two files")
+        raise ToolError("paths must be a list containing at least two files")
 
     sources = [_safe_relpath(path) for path in paths]
     output = _safe_relpath(output_path)
 
     for source in sources:
         if not source.is_file():
-            raise ValueError(f"input is not a regular file: {source}")
+            raise ToolError(f"input is not a regular file: {source}")
         if source == output or (output.exists() and os.path.samefile(source, output)):
-            raise ValueError("output_path must not refer to an input file")
+            raise ToolError("output_path must not refer to an input file")
 
     if output.exists():
         if not output.is_file():
-            raise ValueError("output_path is not a regular file")
+            raise ToolError("output_path is not a regular file")
         if not overwrite:
-            raise ValueError("file exists and overwrite=False")
+            raise ToolError("file exists and overwrite=False")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = None
@@ -605,7 +606,7 @@ def merge_files(paths: list[str], output_path: str, overwrite: bool = True) -> D
                     while chunk := inp.read(1024 * 1024):
                         total += len(chunk)
                         if total > MAX_MERGE_BYTES:
-                            raise ValueError(
+                            raise ToolError(
                                 f"merged file too large ({total} bytes > {MAX_MERGE_BYTES})"
                             )
                         tmp.write(chunk)
@@ -651,23 +652,23 @@ def replace_in_file(
     unrelated lines that happen to contain the replacement text.
     """
     if not isinstance(old, str) or not old:
-        raise ValueError("old must be a non-empty string")
+        raise ToolError("old must be a non-empty string")
     if not isinstance(new, str):
-        raise ValueError("new must be a string")
+        raise ToolError("new must be a string")
     if not isinstance(count, int) or isinstance(count, bool) or count < 1:
-        raise ValueError("count must be a positive integer")
+        raise ToolError("count must be a positive integer")
     if occurrence is not None and (
         not isinstance(occurrence, int) or isinstance(occurrence, bool) or occurrence < 1
     ):
-        raise ValueError("occurrence must be a positive 1-based integer")
+        raise ToolError("occurrence must be a positive 1-based integer")
     if line_number is not None and (
         not isinstance(line_number, int) or isinstance(line_number, bool) or line_number < 1
     ):
-        raise ValueError("line_number must be a positive 1-based integer")
+        raise ToolError("line_number must be a positive 1-based integer")
     if not isinstance(replace_all, bool):
-        raise ValueError("replace_all must be a boolean")
+        raise ToolError("replace_all must be a boolean")
     if sum((occurrence is not None, line_number is not None, replace_all, count != 1)) > 1:
-        raise ValueError("Choose only one selector: occurrence, line_number, replace_all, or count>1")
+        raise ToolError("Choose only one selector: occurrence, line_number, replace_all, or count>1")
 
     full = _safe_relpath(path)
     # Decode bytes directly; keep CRLF intact (Path.read_text normalizes it).
@@ -695,7 +696,7 @@ def replace_in_file(
     if new == old:
         return no_change("unchanged")
     if not positions and occurrence is None and line_number is None:
-        raise ValueError("old text not found in file; no changes made")
+        raise ToolError("old text not found in file; no changes made")
 
     # `old` can remain at the beginning of `new`. Prevent unintended replay
     # *at the selected occurrence*, e.g. foo( -> foo(NULL,.
@@ -718,7 +719,7 @@ def replace_in_file(
 
     if occurrence is not None:
         if occurrence > len(positions):
-            raise ValueError(
+            raise ToolError(
                 f"occurrence {occurrence} out of range: {len(positions)} "
                 "current occurrences; use line_number or more context if an "
                 "earlier replacement removed the old text"
@@ -732,7 +733,7 @@ def replace_in_file(
     elif line_number is not None:
         matches_on_line = [pos for pos in positions if at_line(pos) == line_number]
         if len(matches_on_line) > 1:
-            raise ValueError(
+            raise ToolError(
                 f"line {line_number} has {len(matches_on_line)} occurrences; "
                 "use occurrence=N or include more surrounding text in old"
             )
@@ -758,7 +759,7 @@ def replace_in_file(
                     cursor = pos + len(new)
             if len(hits) == 1:
                 return no_change("already_applied", line_number)
-            raise ValueError(
+            raise ToolError(
                 f"no unique old or already-updated text starting on line {line_number}; "
                 "no changes made; re-read file and select the correct line"
             )
@@ -776,7 +777,7 @@ def replace_in_file(
             return no_change("already_applied", at_line(positions[0]))
         else:
             lines = [at_line(pos) for pos in eligible[:12]]
-            raise ValueError(
+            raise ToolError(
                 f"ambiguous replace: {len(eligible)} unmodified occurrence(s) "
                 f"on lines {lines}{'...' if len(eligible)>12 else ''}, "
                 f"{len(positions) - len(eligible)} occurrences already contain "
@@ -788,7 +789,7 @@ def replace_in_file(
     if not selected:
         if already_applied_line is not None:
             return no_change("already_applied", already_applied_line)
-        raise ValueError("old text not found at the selected location; no changes made")
+        raise ToolError("old text not found at the selected location; no changes made")
 
     # Construct the complete replacement before touching the destination.
     chosen = set(selected)
@@ -869,9 +870,9 @@ def replace_in_file(
 def apply_unified_patch(diff: str, strip: int = 0) -> Dict[str, Any]:
     """Apply a unified diff using patch(1). diff must only reference files."""
     if not isinstance(diff, str) or not diff.strip():
-        raise ValueError("diff must be a non-empty string")
+        raise ToolError("diff must be a non-empty string")
     if strip not in (0, 1):
-        raise ValueError("strip must be 0 or 1")
+        raise ToolError("strip must be 0 or 1")
 
     if not diff.endswith("\n"):
         diff += "\n"
@@ -905,13 +906,13 @@ def apply_unified_patch(diff: str, strip: int = 0) -> Dict[str, Any]:
 def run_bash(command: str, timeout_s: int = 300) -> Dict[str, Any]:
     """Run a bash command in MCP_ROOT."""
     if not isinstance(command, str) or not command.strip():
-        raise ValueError("command must be a non-empty string")
+        raise ToolError("command must be a non-empty string")
     if len(command) > MAX_CMD_CHARS:
-        raise ValueError(f"command too long ({len(command)} chars > {MAX_CMD_CHARS})")
+        raise ToolError(f"command too long ({len(command)} chars > {MAX_CMD_CHARS})")
 
     bad = _dangerous_cmd(command)
     if bad and not ALLOW_DANGEROUS:
-        raise ValueError(f"dangerous command blocked: {bad} (set MCP_ALLOW_DANGEROUS=1 to override)")
+        raise ToolError(f"dangerous command blocked: {bad} (set MCP_ALLOW_DANGEROUS=1 to override)")
 
     r = subprocess.run(
         ["bash", "-lc", command],
@@ -927,17 +928,17 @@ def run_bash(command: str, timeout_s: int = 300) -> Dict[str, Any]:
 def run_ssh(host: str, command: str, timeout_s: int = 300) -> Dict[str, Any]:
     """Run a command over SSH using the user's configured public key."""
     if not isinstance(host, str) or not host.strip():
-        raise ValueError("host must be a non-empty string")
+        raise ToolError("host must be a non-empty string")
     if host != host.strip() or host.startswith("-") or any(c.isspace() for c in host):
-        raise ValueError("host must be an SSH alias, hostname, or user@host without options")
+        raise ToolError("host must be an SSH alias, hostname, or user@host without options")
     if not isinstance(command, str) or not command.strip():
-        raise ValueError("command must be a non-empty string")
+        raise ToolError("command must be a non-empty string")
     if len(command) > MAX_CMD_CHARS:
-        raise ValueError(f"command too long ({len(command)} chars > {MAX_CMD_CHARS})")
+        raise ToolError(f"command too long ({len(command)} chars > {MAX_CMD_CHARS})")
 
     bad = _dangerous_cmd(command)
     if bad and not ALLOW_DANGEROUS:
-        raise ValueError(f"dangerous command blocked: {bad} (set MCP_ALLOW_DANGEROUS=1 to override)")
+        raise ToolError(f"dangerous command blocked: {bad} (set MCP_ALLOW_DANGEROUS=1 to override)")
 
     try:
         r = subprocess.run(
@@ -972,7 +973,7 @@ def run_ssh(host: str, command: str, timeout_s: int = 300) -> Dict[str, Any]:
 def ask_big_brother(question: str) -> Dict[str, Any]:
     """Ask OpenAI with web search enabled for current facts/manuals/docs."""
     if not isinstance(question, str) or not question.strip():
-        raise ValueError("question must be a non-empty string")
+        raise ToolError("question must be a non-empty string")
 
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:

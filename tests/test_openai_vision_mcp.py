@@ -11,27 +11,28 @@ from unittest.mock import patch
 
 from PIL import Image
 
-# MCP is installed in user's venv, but not in this offline test environment.
-if 'mcp' not in sys.modules:
-    mcp_mod = types.ModuleType('mcp')
-    server_mod = types.ModuleType('mcp.server')
-    fastmcp_mod = types.ModuleType('mcp.server.fastmcp')
-    class StubFastMCP:
-        def __init__(self, name, json_response=True):
-            self.name = name
-            self.registry = {}
-        def tool(self):
-            def dec(fn):
-                self.registry[fn.__name__] = fn
-                return fn
-            return dec
-        def run(self): pass
-    fastmcp_mod.FastMCP = StubFastMCP
-    sys.modules['mcp'] = mcp_mod
-    sys.modules['mcp.server'] = server_mod
-    sys.modules['mcp.server.fastmcp'] = fastmcp_mod
+# Load a private server module with a scoped SDK stub, without poisoning
+# sys.modules for other MCP integration tests in the same test process.
+import importlib.util
 
-import mcp_openai_vision as vision
+class StubMCPServer:
+    def __init__(self, name):
+        self.name = name
+        self.registry = {}
+    def tool(self):
+        def dec(fn):
+            self.registry[fn.__name__] = fn
+            return fn
+        return dec
+    def run(self): pass
+
+server_stub = types.ModuleType('mcp.server.mcpserver')
+server_stub.MCPServer = StubMCPServer
+spec = importlib.util.spec_from_file_location(
+    'offline_vision_server', Path(__file__).resolve().parents[1] / 'mcp_openai_vision.py')
+vision = importlib.util.module_from_spec(spec)
+with patch.dict(sys.modules, {'mcp.server.mcpserver': server_stub}):
+    spec.loader.exec_module(vision)
 
 with tempfile.TemporaryDirectory() as temp:
     root=Path(temp)

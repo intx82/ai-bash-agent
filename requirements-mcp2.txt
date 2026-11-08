@@ -1,0 +1,9 @@
+# Application runtime: tested MCP 2.x SDK version.
+mcp==2.3.0
+httpx2>=2.12,<3
+requests==2.32.5
+openai==3.42.0
+pillow==13.0.0
+python-dotenv==1.2.2
+# GTK additionally needs PyGObject and pycairo (system development libraries).
+# Standalone fastmcp is not used. Keep external servers in their own environments.

@@ -15,7 +15,7 @@ A Python-based AI agent that interacts with users through natural language and e
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.10+ (MCP 2.x requirement; current environment tested on Python 3.13)
 - Bash
 - `patch` utility (for applying code patches)
 
@@ -34,7 +34,8 @@ A Python-based AI agent that interacts with users through natural language and e
 
 3. Install dependencies:
    ```bash
-   pip install requests openai
+   python -m pip install -r requirements-mcp2.txt
+   python -m pip check
    ```
 
 4. Configure environment variables (optional):
