@@ -35,6 +35,21 @@
         "get_async_status"
       ]
     },
+    "kicad": {
+      "enabled": true,
+      "required": false,
+      "transport": "stdio",
+      "command": "/home/intl/.nvm/versions/node/v22.17.1/bin/node",
+      "args": [
+        "/home/intl/wrk/dlab/kicad-copilot/dist/index.js"
+      ],
+      "env": {
+        "KICAD_CLI_PATH": "/home/intl/wrk/dlab/ai-bash-agent/kicad-cli"
+      },
+      "timeout_s": 600,
+      "startup_timeout_s": 60,
+      "read_only_tools": []
+    },
     "openai_vision": {
       "enabled": true,
       "required": false,

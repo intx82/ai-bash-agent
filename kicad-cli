@@ -1,0 +1,3 @@
+#!/bin/sh
+# Forward CLI arguments through the KiCad AppImage's bundled runtime.
+exec /home/intl/wrk/tools/kicad-10.0.1-1-x86_64.AppImage kicad-cli "$@"
